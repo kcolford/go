@@ -11,6 +11,7 @@ import (
 	"net"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -95,13 +96,13 @@ func TestReadDotLines(t *testing.T) {
 	r := reader("dotlines\r\n.foo\r\n..bar\n...baz\nquux\r\n\r\n.\r\nanother\n")
 	s, err := r.ReadDotLines()
 	want := []string{"dotlines", "foo", ".bar", "..baz", "quux", ""}
-	if !reflect.DeepEqual(s, want) || err != nil {
+	if !slices.Equal(s, want) || err != nil {
 		t.Fatalf("ReadDotLines: %v, %v", s, err)
 	}
 
 	s, err = r.ReadDotLines()
 	want = []string{"another"}
-	if !reflect.DeepEqual(s, want) || err != io.ErrUnexpectedEOF {
+	if !slices.Equal(s, want) || err != io.ErrUnexpectedEOF {
 		t.Fatalf("ReadDotLines2: %v, %v", s, err)
 	}
 }
@@ -110,13 +111,13 @@ func TestReadDotBytes(t *testing.T) {
 	r := reader("dotlines\r\n.foo\r\n..bar\n...baz\nquux\r\n\r\n.\r\nanot.her\r\n")
 	b, err := r.ReadDotBytes()
 	want := []byte("dotlines\nfoo\n.bar\n..baz\nquux\n\n")
-	if !reflect.DeepEqual(b, want) || err != nil {
+	if !slices.Equal(b, want) || err != nil {
 		t.Fatalf("ReadDotBytes: %q, %v", b, err)
 	}
 
 	b, err = r.ReadDotBytes()
 	want = []byte("anot.her\n")
-	if !reflect.DeepEqual(b, want) || err != io.ErrUnexpectedEOF {
+	if !slices.Equal(b, want) || err != io.ErrUnexpectedEOF {
 		t.Fatalf("ReadDotBytes2: %q, %v", b, err)
 	}
 }
@@ -410,6 +411,8 @@ func TestReadMultiLineError(t *testing.T) {
 		"Unexpected but legal text!\n" +
 		"5.1.1 https://support.google.com/mail/answer/6596 h20si25154304pfd.166 - gsmtp"
 
+	wantError := `550 "5.1.1 The email account that you tried to reach does not exist. Please try\n5.1.1 double-checking the recipient's email address for typos or\n5.1.1 unnecessary spaces. Learn more at\nUnexpected but legal text!\n5.1.1 https://support.google.com/mail/answer/6596 h20si25154304pfd.166 - gsmtp"`
+
 	code, msg, err := r.ReadResponse(250)
 	if err == nil {
 		t.Errorf("ReadResponse: no error, want error")
@@ -420,8 +423,8 @@ func TestReadMultiLineError(t *testing.T) {
 	if msg != wantMsg {
 		t.Errorf("ReadResponse: msg=%q, want %q", msg, wantMsg)
 	}
-	if err != nil && err.Error() != "550 "+wantMsg {
-		t.Errorf("ReadResponse: error=%q, want %q", err.Error(), "550 "+wantMsg)
+	if err != nil && err.Error() != wantError {
+		t.Errorf("ReadResponse: error=%q, want %q", err.Error(), wantError)
 	}
 }
 

@@ -31,7 +31,7 @@ func TestMain(m *testing.M) {
 func interestingGoroutines() (gs []string) {
 	buf := make([]byte, 2<<20)
 	buf = buf[:runtime.Stack(buf, true)]
-	for _, g := range strings.Split(string(buf), "\n\n") {
+	for g := range strings.SplitSeq(string(buf), "\n\n") {
 		_, stack, _ := strings.Cut(g, "\n")
 		stack = strings.TrimSpace(stack)
 		if stack == "" ||
@@ -137,9 +137,10 @@ func afterTest(t testing.TB) {
 		").readLoop(":  "a Transport",
 		").writeLoop(": "a Transport",
 		"created by net/http/httptest.(*Server).Start": "an httptest.Server",
-		"timeoutHandler":        "a TimeoutHandler",
-		"net.(*netFD).connect(": "a timing out dial",
-		").noteClientGone(":     "a closenotifier sender",
+		"timeoutHandler":           "a TimeoutHandler",
+		"net.(*netFD).connect(":    "a timing out dial",
+		").noteClientGone(":        "a closenotifier sender",
+		"quic.(*Endpoint).listen(": "a quic.Endpoint",
 	}
 	var stacks string
 	for i := 0; i < 2500; i++ {

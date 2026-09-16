@@ -9,10 +9,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 
 	"cmd/compile/internal/base"
-	"cmd/internal/notsha256"
+	"cmd/internal/hash"
 )
 
 // BuiltinPkg is a fake package that declares the universe block.
@@ -183,7 +184,7 @@ var BasicTypeNames = []string{
 }
 
 var fmtBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
@@ -430,10 +431,11 @@ func tconv2(b *bytes.Buffer, t *Type, verb rune, mode fmtMode, visited map[*Type
 			case IsExported(f.Sym.Name):
 				sconv2(b, f.Sym, 'S', mode)
 			default:
+				smode := mode
 				if mode != fmtTypeIDName {
-					mode = fmtTypeID
+					smode = fmtTypeID
 				}
-				sconv2(b, f.Sym, 'v', mode)
+				sconv2(b, f.Sym, 'v', smode)
 			}
 			tconv2(b, f.Type, 'S', mode, visited)
 		}
@@ -471,11 +473,11 @@ func tconv2(b *bytes.Buffer, t *Type, verb rune, mode fmtMode, visited map[*Type
 	case TSTRUCT:
 		if m := t.StructType().Map; m != nil {
 			mt := m.MapType()
-			// Format the bucket struct for map[x]y as map.bucket[x]y.
+			// Format the bucket struct for map[x]y as map.group[x]y.
 			// This avoids a recursive print that generates very long names.
 			switch t {
-			case mt.Bucket:
-				b.WriteString("map.bucket[")
+			case mt.Group:
+				b.WriteString("map.group[")
 			default:
 				base.Fatalf("unknown internal map type")
 			}
@@ -640,11 +642,21 @@ func SplitVargenSuffix(name string) (base, suffix string) {
 	return name, ""
 }
 
+// SplitMethSuffix returns name split into a defining type name and a .m
+// suffix, if any.
+func SplitMethSuffix(name string) (tname, suffix string) {
+	i := strings.LastIndex(name, ".")
+	if i >= 0 {
+		return name[:i], name[i:]
+	}
+	return name, ""
+}
+
 // TypeHash computes a hash value for type t to use in type switch statements.
 func TypeHash(t *Type) uint32 {
 	p := t.LinkString()
 
-	// Using SHA256 is overkill, but reduces accidental collisions.
-	h := notsha256.Sum256([]byte(p))
+	// Using a cryptographic hash is overkill but minimizes accidental collisions.
+	h := hash.Sum32([]byte(p))
 	return binary.LittleEndian.Uint32(h[:4])
 }

@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build openbsd && !mips64
-
 package syscall
 
 import _ "unsafe"
@@ -12,4 +10,3 @@ import _ "unsafe"
 //go:linkname unlinkat
 //go:linkname openat
 //go:linkname fstatat
-//go:linkname getentropy

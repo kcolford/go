@@ -10,6 +10,7 @@ import (
 	"internal/testenv"
 	"math/rand"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -417,6 +418,9 @@ func testAfterStop(t *testing.T, newTimer func(Duration) *Timer) {
 	logErrs()
 }
 
+// TestAfterQueuing checks that concurrent After calls are queued by deadline:
+// timers created in one order but with deadlines in another must fire in
+// deadline order, and each must fire near its deadline.
 func TestAfterQueuing(t *testing.T) {
 	t.Run("impl=chan", func(t *testing.T) {
 		testAfterQueuing(t, After)
@@ -427,8 +431,10 @@ func TestAfterQueuing(t *testing.T) {
 }
 
 func testAfterQueuing(t *testing.T, after func(Duration) <-chan Time) {
-	// This test flakes out on some systems,
-	// so we'll try it a few times before declaring it a failure.
+	// The arrival time check below depends on the timers running roughly on
+	// schedule, which a loaded machine cannot promise, so try a few times with
+	// increasing deltas before declaring a failure. The ordering check does not
+	// depend on load and would not benefit from a retry.
 	const attempts = 5
 	err := errors.New("!=nil")
 	for i := 0; i < attempts && err != nil; i++ {
@@ -461,23 +467,33 @@ func testAfterQueuing1(delta Duration, after func(Duration) <-chan Time) error {
 
 	t0 := Now()
 	for _, slot := range slots {
-		go await(slot, result, After(Duration(slot)*delta))
+		go await(slot, result, after(Duration(slot)*delta))
 	}
-	var order []int
-	var times []Time
+	results := make([]afterResult, 0, len(slots))
 	for range slots {
-		r := <-result
-		order = append(order, r.slot)
-		times = append(times, r.t)
+		results = append(results, <-result)
 	}
-	for i := range order {
-		if i > 0 && order[i] < order[i-1] {
-			return fmt.Errorf("After calls returned out of order: %v", order)
+
+	// Sort by the time each timer reported, which is the order the timers
+	// fired in. The order in which the goroutines started above manage to send
+	// on result is up to the scheduler, not the timers, so it says nothing
+	// about whether the timers were queued correctly.
+	slices.SortStableFunc(results, func(a, b afterResult) int {
+		return a.t.Compare(b.t)
+	})
+	for i := range results {
+		if i > 0 && results[i].slot < results[i-1].slot {
+			fired := make([]int, len(results))
+			for j, r := range results {
+				fired[j] = r.slot
+			}
+			return fmt.Errorf("After calls fired out of order: %v", fired)
 		}
 	}
-	for i, t := range times {
-		dt := t.Sub(t0)
-		target := Duration(order[i]) * delta
+
+	for _, r := range results {
+		dt := r.t.Sub(t0)
+		target := Duration(r.slot) * delta
 		if dt < target-delta/2 || dt > target+delta*10 {
 			return fmt.Errorf("After(%s) arrived at %s, expected [%s,%s]", target, dt, target-delta/2, target+delta*10)
 		}
@@ -628,7 +644,7 @@ func TestOverflowPeriodRuntimeTimer(t *testing.T) {
 	CheckRuntimeTimerPeriodOverflow()
 }
 
-func checkZeroPanicString(t *testing.T) {
+func checkZeroTimerPanicString(t *testing.T) {
 	e := recover()
 	s, _ := e.(string)
 	if want := "called on uninitialized Timer"; !strings.Contains(s, want) {
@@ -637,14 +653,36 @@ func checkZeroPanicString(t *testing.T) {
 }
 
 func TestZeroTimerResetPanics(t *testing.T) {
-	defer checkZeroPanicString(t)
+	defer checkZeroTimerPanicString(t)
 	var tr Timer
 	tr.Reset(1)
 }
 
 func TestZeroTimerStopPanics(t *testing.T) {
-	defer checkZeroPanicString(t)
+	defer checkZeroTimerPanicString(t)
 	var tr Timer
+	tr.Stop()
+}
+
+func checkCopiedTimerPanicString(t *testing.T) {
+	e := recover()
+	s, _ := e.(string)
+	if want := "called on copied Timer"; !strings.Contains(s, want) {
+		t.Errorf("panic = %v; want substring %q", e, want)
+	}
+}
+
+func TestCopiedTimerResetPanics(t *testing.T) {
+	defer checkCopiedTimerPanicString(t)
+	var tr Timer
+	tr = *NewTimer(0)
+	tr.Reset(1)
+}
+
+func TestCopiedTimerStopPanics(t *testing.T) {
+	defer checkCopiedTimerPanicString(t)
+	var tr Timer
+	tr = *NewTimer(0)
 	tr.Stop()
 }
 
@@ -785,6 +823,109 @@ func TestAdjustTimers(t *testing.T) {
 	}
 }
 
+func TestStopResult(t *testing.T) {
+	testStopResetResult(t, true)
+}
+
+func TestResetResult(t *testing.T) {
+	testStopResetResult(t, false)
+}
+
+// Test that when racing between running a timer and stopping a timer Stop
+// consistently indicates whether a value can be read from the channel.
+// Issue #69312.
+func testStopResetResult(t *testing.T, testStop bool) {
+	stopOrReset := func(timer *Timer) bool {
+		if testStop {
+			return timer.Stop()
+		} else {
+			return timer.Reset(1 * Hour)
+		}
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	const N = 1000
+	wg.Add(N)
+	for range N {
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 100; j++ {
+				timer1 := NewTimer(1 * Millisecond)
+				timer2 := NewTimer(1 * Millisecond)
+				select {
+				case <-timer1.C:
+					if !stopOrReset(timer2) {
+						// The test fails if this
+						// channel read times out.
+						<-timer2.C
+					}
+				case <-timer2.C:
+					if !stopOrReset(timer1) {
+						// The test fails if this
+						// channel read times out.
+						<-timer1.C
+					}
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}
+
+// Test having a large number of goroutines wake up a ticker simultaneously.
+// This used to trigger a crash when run under x/tools/cmd/stress.
+func TestMultiWakeupTicker(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short")
+	}
+
+	goroutines := runtime.GOMAXPROCS(0)
+	timer := NewTicker(Microsecond)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			for range 100000 {
+				select {
+				case <-timer.C:
+				case <-After(Millisecond):
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// Test having a large number of goroutines wake up a timer simultaneously.
+// This used to trigger a crash when run under x/tools/cmd/stress.
+func TestMultiWakeupTimer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short")
+	}
+
+	goroutines := runtime.GOMAXPROCS(0)
+	timer := NewTimer(Nanosecond)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			for range 10000 {
+				select {
+				case <-timer.C:
+				default:
+				}
+				timer.Reset(Nanosecond)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // Benchmark timer latency when the thread that creates the timer is busy with
 // other work and the timers must be serviced by other threads.
 // https://golang.org/issue/38860
@@ -824,7 +965,6 @@ func BenchmarkParallelTimerLatency(b *testing.B) {
 		wg.Add(timerCount)
 		atomic.StoreInt32(&count, 0)
 		for j := 0; j < timerCount; j++ {
-			j := j
 			expectedWakeup := Now().Add(delay)
 			AfterFunc(delay, func() {
 				late := Since(expectedWakeup)
@@ -855,17 +995,15 @@ func BenchmarkParallelTimerLatency(b *testing.B) {
 	}
 	var total float64
 	var samples float64
-	max := Duration(0)
+	maximum := Duration(0)
 	for _, s := range stats {
-		if s.max > max {
-			max = s.max
-		}
+		maximum = max(maximum, s.max)
 		total += s.sum
 		samples += float64(s.count)
 	}
 	b.ReportMetric(0, "ns/op")
 	b.ReportMetric(total/samples, "avg-late-ns")
-	b.ReportMetric(float64(max.Nanoseconds()), "max-late-ns")
+	b.ReportMetric(float64(maximum.Nanoseconds()), "max-late-ns")
 }
 
 // Benchmark timer latency with staggered wakeup times and varying CPU bound
@@ -900,7 +1038,6 @@ func BenchmarkStaggeredTickerLatency(b *testing.B) {
 					var wg sync.WaitGroup
 					wg.Add(tickerCount)
 					for j := 0; j < tickerCount; j++ {
-						j := j
 						doWork(delay / Duration(gmp))
 						expectedWakeup := Now().Add(delay)
 						ticker := NewTicker(delay)

@@ -39,16 +39,7 @@ func cloneURLValues(v url.Values) url.Values {
 //
 //go:linkname cloneURL
 func cloneURL(u *url.URL) *url.URL {
-	if u == nil {
-		return nil
-	}
-	u2 := new(url.URL)
-	*u2 = *u
-	if u.User != nil {
-		u2.User = new(url.Userinfo)
-		*u2.User = *u.User
-	}
-	return u2
+	return u.Clone()
 }
 
 // cloneMultipartForm should be an internal detail,
@@ -68,7 +59,7 @@ func cloneMultipartForm(f *multipart.Form) *multipart.Form {
 		Value: (map[string][]string)(Header(f.Value).Clone()),
 	}
 	if f.File != nil {
-		m := make(map[string][]*multipart.FileHeader)
+		m := make(map[string][]*multipart.FileHeader, len(f.File))
 		for k, vv := range f.File {
 			vv2 := make([]*multipart.FileHeader, len(vv))
 			for i, v := range vv {

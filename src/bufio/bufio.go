@@ -29,6 +29,9 @@ var (
 // Buffered input.
 
 // Reader implements buffering for an io.Reader object.
+// A new Reader is created by calling [NewReader] or [NewReaderSize];
+// alternatively the zero value of a Reader may be used after calling [Reader.Reset]
+// on it.
 type Reader struct {
 	buf          []byte
 	rd           io.Reader // reader provided by the client
@@ -130,9 +133,10 @@ func (b *Reader) readErr() error {
 }
 
 // Peek returns the next n bytes without advancing the reader. The bytes stop
-// being valid at the next read call. If Peek returns fewer than n bytes, it
-// also returns an error explaining why the read is short. The error is
-// [ErrBufferFull] if n is larger than b's buffer size.
+// being valid at the next read call. If necessary, Peek will read more bytes
+// into the buffer in order to make n bytes available. If Peek returns fewer
+// than n bytes, it also returns an error explaining why the read is short.
+// The error is [ErrBufferFull] if n is larger than b's buffer size.
 //
 // Calling Peek prevents a [Reader.UnreadByte] or [Reader.UnreadRune] call from succeeding
 // until the next read operation.
@@ -307,10 +311,7 @@ func (b *Reader) ReadRune() (r rune, size int, err error) {
 	if b.r == b.w {
 		return 0, 0, b.readErr()
 	}
-	r, size = rune(b.buf[b.r]), 1
-	if r >= utf8.RuneSelf {
-		r, size = utf8.DecodeRune(b.buf[b.r:b.w])
-	}
+	r, size = utf8.DecodeRune(b.buf[b.r:b.w])
 	b.r += size
 	b.lastByte = int(b.buf[b.r-1])
 	b.lastRuneSize = size
@@ -515,9 +516,11 @@ func (b *Reader) WriteTo(w io.Writer) (n int64, err error) {
 	b.lastByte = -1
 	b.lastRuneSize = -1
 
-	n, err = b.writeBuf(w)
-	if err != nil {
-		return
+	if b.r < b.w {
+		n, err = b.writeBuf(w)
+		if err != nil {
+			return
+		}
 	}
 
 	if r, ok := b.rd.(io.WriterTo); ok {
@@ -742,36 +745,55 @@ func (b *Writer) WriteRune(r rune) (size int, err error) {
 // If the count is less than len(s), it also returns an error explaining
 // why the write is short.
 func (b *Writer) WriteString(s string) (int, error) {
-	var sw io.StringWriter
-	tryStringWriter := true
+	if b.err != nil {
+		return 0, b.err
+	}
 
-	nn := 0
-	for len(s) > b.Available() && b.err == nil {
+	if len(s) <= b.Available() {
+		// Fast path: the whole string fits in the buffer.
+		n := copy(b.buf[b.n:], s)
+		b.n += n
+		return n, nil
+	}
+
+	sw, ok := b.wr.(io.StringWriter)
+
+	total := 0
+	if ok && b.Buffered() == 0 {
+		// Large write, empty buffer, and the underlying writer supports
+		// WriteString: forward the write to the underlying StringWriter.
+		// This avoids an extra copy.
 		var n int
-		if b.Buffered() == 0 && sw == nil && tryStringWriter {
-			// Check at most once whether b.wr is a StringWriter.
-			sw, tryStringWriter = b.wr.(io.StringWriter)
+		n, b.err = sw.WriteString(s)
+		if n == len(s) || b.err != nil {
+			return n, b.err
 		}
-		if b.Buffered() == 0 && tryStringWriter {
-			// Large write, empty buffer, and the underlying writer supports
-			// WriteString: forward the write to the underlying StringWriter.
-			// This avoids an extra copy.
+		total = n
+		s = s[n:]
+	}
+
+	for {
+		var n int
+		if ok && b.Buffered() == 0 {
 			n, b.err = sw.WriteString(s)
 		} else {
 			n = copy(b.buf[b.n:], s)
 			b.n += n
 			b.Flush()
 		}
-		nn += n
+		total += n
 		s = s[n:]
+		if len(s) <= b.Available() || b.err != nil {
+			break
+		}
 	}
 	if b.err != nil {
-		return nn, b.err
+		return total, b.err
 	}
 	n := copy(b.buf[b.n:], s)
 	b.n += n
-	nn += n
-	return nn, nil
+	total += n
+	return total, nil
 }
 
 // ReadFrom implements [io.ReaderFrom]. If the underlying writer

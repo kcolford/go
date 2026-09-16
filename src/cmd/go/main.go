@@ -24,7 +24,6 @@ import (
 	"cmd/go/internal/clean"
 	"cmd/go/internal/doc"
 	"cmd/go/internal/envcmd"
-	"cmd/go/internal/fix"
 	"cmd/go/internal/fmtcmd"
 	"cmd/go/internal/generate"
 	"cmd/go/internal/help"
@@ -55,27 +54,29 @@ func init() {
 		clean.CmdClean,
 		doc.CmdDoc,
 		envcmd.CmdEnv,
-		fix.CmdFix,
+		vet.CmdFix,
 		fmtcmd.CmdFmt,
 		generate.CmdGenerate,
 		modget.CmdGet,
 		work.CmdInstall,
 		list.CmdList,
 		modcmd.CmdMod,
-		workcmd.CmdWork,
 		run.CmdRun,
 		telemetrycmd.CmdTelemetry,
 		test.CmdTest,
 		tool.CmdTool,
 		version.CmdVersion,
 		vet.CmdVet,
+		workcmd.CmdWork,
 
 		help.HelpBuildConstraint,
+		help.HelpBuildJSON,
 		help.HelpBuildmode,
 		help.HelpC,
 		help.HelpCache,
 		help.HelpEnvironment,
 		help.HelpFileType,
+		help.HelpGoAuth,
 		modload.HelpGoMod,
 		help.HelpGopath,
 		modfetch.HelpGoproxy,
@@ -97,11 +98,16 @@ var counterErrorsGOPATHEntryRelative = counter.New("go/errors:gopath-entry-relat
 func main() {
 	log.SetFlags(0)
 	telemetry.MaybeChild() // Run in child mode if this is the telemetry sidecar child process.
-	counter.Open()         // Open the telemetry counter file so counters can be written to it.
+	cmdIsGoTelemetryOff := cmdIsGoTelemetryOff()
+	if !cmdIsGoTelemetryOff {
+		counter.Open() // Open the telemetry counter file so counters can be written to it.
+	}
 	handleChdirFlag()
 	toolchain.Select()
 
-	telemetry.MaybeParent() // Run the upload process. Opening the counter file is idempotent.
+	if !cmdIsGoTelemetryOff {
+		telemetry.MaybeParent() // Run the upload process. Opening the counter file is idempotent.
+	}
 	flag.Usage = base.Usage
 	flag.Parse()
 	counter.Inc("go/invocations")
@@ -146,7 +152,7 @@ func main() {
 	// This setting is equivalent to not setting GOPATH at all,
 	// which is not what most people want when they do it.
 	if gopath := cfg.BuildContext.GOPATH; filepath.Clean(gopath) == filepath.Clean(cfg.GOROOT) {
-		fmt.Fprintf(os.Stderr, "warning: GOPATH set to GOROOT (%s) has no effect\n", gopath)
+		fmt.Fprintf(os.Stderr, "warning: both GOPATH and GOROOT are the same directory (%s); see https://go.dev/wiki/InstallTroubleshooting\n", gopath)
 	} else {
 		for _, p := range filepath.SplitList(gopath) {
 			// Some GOPATHs have empty directory elements - ignore them.
@@ -178,7 +184,7 @@ func main() {
 	cmd, used := lookupCmd(args)
 	cfg.CmdName = strings.Join(args[:used], " ")
 	if len(cmd.Commands) > 0 {
-		if used >= len(args) {
+		if used >= len(args) || strings.HasPrefix(args[used], "-") {
 			help.PrintUsage(os.Stderr, cmd)
 			base.SetExitStatus(2)
 			base.Exit()
@@ -212,6 +218,41 @@ func main() {
 	telemetrystats.Increment()
 	invoke(cmd, args[used-1:])
 	base.Exit()
+}
+
+// cmdIsGoTelemetryOff reports whether the command is "go telemetry off". This
+// is used to decide whether to disable the opening of counter files. See #69269.
+func cmdIsGoTelemetryOff() bool {
+	restArgs := os.Args[1:]
+	// skipChdirFlag skips the -C flag, which is the only flag that can appear
+	// in a valid 'go telemetry off' command, and which hasn't been processed
+	// yet. We need to determine if the command is 'go telemetry off' before we open
+	// the counter file, but we want to process -C after we open counters so that
+	// we can increment the flag counter for it.
+	skipChdirFlag := func() {
+		if len(restArgs) == 0 {
+			return
+		}
+		switch a := restArgs[0]; {
+		case a == "-C", a == "--C":
+			if len(restArgs) < 2 {
+				restArgs = nil
+				return
+			}
+			restArgs = restArgs[2:]
+
+		case strings.HasPrefix(a, "-C="), strings.HasPrefix(a, "--C="):
+			restArgs = restArgs[1:]
+		}
+	}
+	skipChdirFlag()
+	cmd, used := lookupCmd(restArgs)
+	if cmd != telemetrycmd.CmdTelemetry {
+		return false
+	}
+	restArgs = restArgs[used:]
+	skipChdirFlag()
+	return len(restArgs) == 1 && restArgs[0] == "off"
 }
 
 // lookupCmd interprets the initial elements of args

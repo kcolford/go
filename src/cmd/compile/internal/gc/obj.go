@@ -20,6 +20,7 @@ import (
 	"cmd/internal/objabi"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -41,12 +42,29 @@ const (
 	modeLinkerObj
 )
 
+func notifyExport() {
+	f := os.NewFile(uintptr(base.Flag.ExportFD), "exportfd")
+	if _, err := f.Write([]byte{'\n'}); err != nil {
+		base.FlushErrors()
+		fmt.Printf("can't write to export fd %d: %v\n", base.Flag.ExportFD, err)
+		base.ErrorExit()
+	}
+	if err := f.Close(); err != nil {
+		base.FlushErrors()
+		fmt.Printf("can't close export fd %d: %v\n", base.Flag.ExportFD, err)
+		base.ErrorExit()
+	}
+}
+
 func dumpobj() {
 	if base.Flag.LinkObj == "" {
 		dumpobj1(base.Flag.LowerO, modeCompilerObj|modeLinkerObj)
 		return
 	}
 	dumpobj1(base.Flag.LowerO, modeCompilerObj)
+	if base.Flag.ExportFD > 0 {
+		notifyExport()
+	}
 	dumpobj1(base.Flag.LinkObj, modeLinkerObj)
 }
 
@@ -57,7 +75,7 @@ func dumpobj1(outfile string, mode int) {
 		fmt.Printf("can't create %s: %v\n", outfile, err)
 		base.ErrorExit()
 	}
-	defer bout.Close()
+
 	bout.WriteString("!<arch>\n")
 
 	if mode&modeCompilerObj != 0 {
@@ -69,6 +87,12 @@ func dumpobj1(outfile string, mode int) {
 		start := startArchiveEntry(bout)
 		dumpLinkerObj(bout)
 		finishArchiveEntry(bout, start, "_go_.o")
+	}
+
+	if err := bout.Close(); err != nil {
+		base.FlushErrors()
+		fmt.Printf("error while writing to file %s: %v\n", outfile, err)
+		base.ErrorExit()
 	}
 }
 

@@ -10,10 +10,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"iter"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 )
 
 var debug = flag.Bool("debug", false, "show the errors produced by the tests")
@@ -41,7 +43,8 @@ type T struct {
 	SIEmpty []int
 	SB      []bool
 	// Arrays
-	AI [3]int
+	AI  [3]int
+	PAI *[3]int // pointer to array
 	// Maps
 	MSI      map[string]int
 	MSIone   map[string]int // one element, for deterministic output
@@ -70,10 +73,12 @@ type T struct {
 	Str fmt.Stringer
 	Err error
 	// Pointers
-	PI  *int
-	PS  *string
-	PSI *[]int
-	NIL *int
+	PI       *int
+	PS       *string
+	PSI      *[]int
+	NIL      *int
+	UPI      unsafe.Pointer
+	EmptyUPI unsafe.Pointer
 	// Function (not method)
 	BinaryFunc             func(string, string) string
 	VariadicFunc           func(...string) string
@@ -138,6 +143,7 @@ var tVal = &T{
 	SI:     []int{3, 4, 5},
 	SICap:  make([]int, 5, 10),
 	AI:     [3]int{3, 4, 5},
+	PAI:    &[3]int{3, 4, 5},
 	SB:     []bool{true, false},
 	MSI:    map[string]int{"one": 1, "two": 2, "three": 3},
 	MSIone: map[string]int{"one": 1},
@@ -165,6 +171,7 @@ var tVal = &T{
 	PI:                        newInt(23),
 	PS:                        newString("a string"),
 	PSI:                       newIntSlice(21, 22, 23),
+	UPI:                       newUnsafePointer(23),
 	BinaryFunc:                func(a, b string) string { return fmt.Sprintf("[%s=%s]", a, b) },
 	VariadicFunc:              func(s ...string) string { return fmt.Sprint("<", strings.Join(s, "+"), ">") },
 	VariadicFuncInt:           func(a int, s ...string) string { return fmt.Sprint(a, "=<", strings.Join(s, "+"), ">") },
@@ -189,6 +196,10 @@ var iVal I = tVal
 // Helpers for creation.
 func newInt(n int) *int {
 	return &n
+}
+
+func newUnsafePointer(n int) unsafe.Pointer {
+	return unsafe.Pointer(&n)
 }
 
 func newString(s string) *string {
@@ -399,6 +410,9 @@ var execTests = []execTest{
 	{"Interface Call", `{{stringer .S}}`, "foozle", map[string]any{"S": bytes.NewBufferString("foozle")}, true},
 	{".ErrFunc", "{{call .ErrFunc}}", "bla", tVal, true},
 	{"call nil", "{{call nil}}", "", tVal, false},
+	{"empty call", "{{call}}", "", tVal, false},
+	{"empty call after pipe valid", "{{.ErrFunc | call}}", "bla", tVal, true},
+	{"empty call after pipe invalid", "{{1 | call}}", "", tVal, false},
 
 	// Erroneous function calls (check args).
 	{".BinaryFuncTooFew", "{{call .BinaryFunc `1`}}", "", tVal, false},
@@ -439,6 +453,10 @@ var execTests = []execTest{
 	{"if 0.0", "{{if .FloatZero}}NON-ZERO{{else}}ZERO{{end}}", "ZERO", tVal, true},
 	{"if 1.5i", "{{if 1.5i}}NON-ZERO{{else}}ZERO{{end}}", "NON-ZERO", tVal, true},
 	{"if 0.0i", "{{if .ComplexZero}}NON-ZERO{{else}}ZERO{{end}}", "ZERO", tVal, true},
+	{"if nonNilPointer", "{{if .PI}}NON-ZERO{{else}}ZERO{{end}}", "NON-ZERO", tVal, true},
+	{"if nilPointer", "{{if .NIL}}NON-ZERO{{else}}ZERO{{end}}", "ZERO", tVal, true},
+	{"if UPI", "{{if .UPI}}NON-ZERO{{else}}ZERO{{end}}", "NON-ZERO", tVal, true},
+	{"if EmptyUPI", "{{if .EmptyUPI}}NON-ZERO{{else}}ZERO{{end}}", "ZERO", tVal, true},
 	{"if emptystring", "{{if ``}}NON-EMPTY{{else}}EMPTY{{end}}", "EMPTY", tVal, true},
 	{"if string", "{{if `notempty`}}NON-EMPTY{{else}}EMPTY{{end}}", "NON-EMPTY", tVal, true},
 	{"if emptyslice", "{{if .SIEmpty}}NON-EMPTY{{else}}EMPTY{{end}}", "EMPTY", tVal, true},
@@ -540,6 +558,9 @@ var execTests = []execTest{
 	{"array[:]", "{{slice .AI}}", "[3 4 5]", tVal, true},
 	{"array[1:]", "{{slice .AI 1}}", "[4 5]", tVal, true},
 	{"array[1:2]", "{{slice .AI 1 2}}", "[4]", tVal, true},
+	{"pointer to array[:]", "{{slice .PAI}}", "[3 4 5]", tVal, true},
+	{"pointer to array[1:]", "{{slice .PAI 1}}", "[4 5]", tVal, true},
+	{"pointer to array[1:2]", "{{slice .PAI 1 2}}", "[4]", tVal, true},
 	{"string[:]", "{{slice .S}}", "xyz", tVal, true},
 	{"string[0:1]", "{{slice .S 0 1}}", "x", tVal, true},
 	{"string[1:]", "{{slice .S 1}}", "yz", tVal, true},
@@ -601,6 +622,30 @@ var execTests = []execTest{
 	{"declare in range", "{{range $x := .PSI}}<{{$foo:=$x}}{{$x}}>{{end}}", "<21><22><23>", tVal, true},
 	{"range count", `{{range $i, $x := count 5}}[{{$i}}]{{$x}}{{end}}`, "[0]a[1]b[2]c[3]d[4]e", tVal, true},
 	{"range nil count", `{{range $i, $x := count 0}}{{else}}empty{{end}}`, "empty", tVal, true},
+	{"range iter.Seq[int]", `{{range $i := .}}{{$i}}{{end}}`, "01", fVal1(2), true},
+	{"i = range iter.Seq[int]", `{{$i := 0}}{{range $i = .}}{{$i}}{{end}}`, "01", fVal1(2), true},
+	{"range iter.Seq[int] over two var", `{{range $i, $c := .}}{{$c}}{{end}}`, "", fVal1(2), false},
+	{"i, c := range iter.Seq2[int,int]", `{{range $i, $c := .}}{{$i}}{{$c}}{{end}}`, "0112", fVal2(2), true},
+	{"i, c = range iter.Seq2[int,int]", `{{$i := 0}}{{$c := 0}}{{range $i, $c = .}}{{$i}}{{$c}}{{end}}`, "0112", fVal2(2), true},
+	{"i = range iter.Seq2[int,int]", `{{$i := 0}}{{range $i = .}}{{$i}}{{end}}`, "01", fVal2(2), true},
+	{"i := range iter.Seq2[int,int]", `{{range $i := .}}{{$i}}{{end}}`, "01", fVal2(2), true},
+	{"i,c,x range iter.Seq2[int,int]", `{{$i := 0}}{{$c := 0}}{{$x := 0}}{{range $i, $c = .}}{{$i}}{{$c}}{{end}}`, "0112", fVal2(2), true},
+	{"i,x range iter.Seq[int]", `{{$i := 0}}{{$x := 0}}{{range $i = .}}{{$i}}{{end}}`, "01", fVal1(2), true},
+	{"range iter.Seq[int] else", `{{range $i := .}}{{$i}}{{else}}empty{{end}}`, "empty", fVal1(0), true},
+	{"range iter.Seq2[int,int] else", `{{range $i := .}}{{$i}}{{else}}empty{{end}}`, "empty", fVal2(0), true},
+	{"range int8", rangeTestInt, rangeTestData[int8](), int8(5), true},
+	{"range int16", rangeTestInt, rangeTestData[int16](), int16(5), true},
+	{"range int32", rangeTestInt, rangeTestData[int32](), int32(5), true},
+	{"range int64", rangeTestInt, rangeTestData[int64](), int64(5), true},
+	{"range int", rangeTestInt, rangeTestData[int](), int(5), true},
+	{"range uint8", rangeTestInt, rangeTestData[uint8](), uint8(5), true},
+	{"range uint16", rangeTestInt, rangeTestData[uint16](), uint16(5), true},
+	{"range uint32", rangeTestInt, rangeTestData[uint32](), uint32(5), true},
+	{"range uint64", rangeTestInt, rangeTestData[uint64](), uint64(5), true},
+	{"range uint", rangeTestInt, rangeTestData[uint](), uint(5), true},
+	{"range uintptr", rangeTestInt, rangeTestData[uintptr](), uintptr(5), true},
+	{"range uintptr(0)", `{{range $v := .}}{{print $v}}{{else}}empty{{end}}`, "empty", uintptr(0), true},
+	{"range 5", `{{range $v := 5}}{{printf "%T%d" $v $v}}{{end}}`, rangeTestData[int](), nil, true},
 
 	// Cute examples.
 	{"or as if true", `{{or .SI "slice is empty"}}`, "[3 4 5]", tVal, true},
@@ -703,6 +748,37 @@ var execTests = []execTest{
 
 	{"issue56490", "{{$i := 0}}{{$x := 0}}{{range $i = .AI}}{{end}}{{$i}}", "5", tVal, true},
 	{"issue60801", "{{$k := 0}}{{$v := 0}}{{range $k, $v = .AI}}{{$k}}={{$v}} {{end}}", "0=3 1=4 2=5 ", tVal, true},
+}
+
+func fVal1(i int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for v := range i {
+			if !yield(v) {
+				break
+			}
+		}
+	}
+}
+
+func fVal2(i int) iter.Seq2[int, int] {
+	return func(yield func(int, int) bool) {
+		for v := range i {
+			if !yield(v, v+1) {
+				break
+			}
+		}
+	}
+}
+
+const rangeTestInt = `{{range $v := .}}{{printf "%T%d" $v $v}}{{end}}`
+
+func rangeTestData[T int | int8 | int16 | int32 | int64 | uint | uint8 | uint16 | uint32 | uint64 | uintptr]() string {
+	I := T(5)
+	var buf strings.Builder
+	for i := T(0); i < I; i++ {
+		fmt.Fprintf(&buf, "%T%d", i, i)
+	}
+	return buf.String()
 }
 
 func zeroArgs() string {
@@ -851,7 +927,6 @@ func TestDelims(t *testing.T) {
 	const hello = "Hello, world"
 	var value = struct{ Str string }{hello}
 	for i := 0; i < len(delimPairs); i += 2 {
-		text := ".Str"
 		left := delimPairs[i+0]
 		trueLeft := left
 		right := delimPairs[i+1]
@@ -862,15 +937,21 @@ func TestDelims(t *testing.T) {
 		if right == "" { // default case
 			trueRight = "}}"
 		}
-		text = trueLeft + text + trueRight
-		// Now add a comment
-		text += trueLeft + "/*comment*/" + trueRight
-		// Now add  an action containing a string.
-		text += trueLeft + `"` + trueLeft + `"` + trueRight
+		action := trueLeft + ".Str" + trueRight
+		// A comment, which is not preserved in the parse tree.
+		comment := trueLeft + "/*comment*/" + trueRight
+		// An action containing a string that looks like the left delimiter.
+		strAction := trueLeft + `"` + trueLeft + `"` + trueRight
+		text := action + comment + strAction
 		// At this point text looks like `{{.Str}}{{/*comment*/}}{{"{{"}}`.
 		tmpl, err := New("delims").Delims(left, right).Parse(text)
 		if err != nil {
 			t.Fatalf("delim %q text %q parse err %s", left, text, err)
+		}
+		// The parse tree's String form should roundtrip back to the input,
+		// using the custom delimiters, modulo the dropped comment.
+		if got, want := tmpl.Root.String(), action+strAction; got != want {
+			t.Errorf("delim %q: String() = %q, want %q", left, got, want)
 		}
 		var b = new(strings.Builder)
 		err = tmpl.Execute(b, value)
@@ -944,8 +1025,7 @@ func TestExecError_CustomError(t *testing.T) {
 	var b bytes.Buffer
 	err := tmpl.Execute(&b, nil)
 
-	var e *CustomError
-	if !errors.As(err, &e) {
+	if _, ok := errors.AsType[*CustomError](err); !ok {
 		t.Fatalf("expected custom error; got %s", err)
 	}
 }
@@ -1431,6 +1511,44 @@ func TestBadFuncNames(t *testing.T) {
 	}
 	for _, name := range names {
 		testBadFuncName(name, t)
+	}
+}
+
+func TestIsTrue(t *testing.T) {
+	var nil_ptr *int
+	var nil_chan chan int
+	tests := []struct {
+		v    any
+		want bool
+	}{
+		{1, true},
+		{0, false},
+		{uint8(1), true},
+		{uint8(0), false},
+		{float64(1.0), true},
+		{float64(0.0), false},
+		{complex64(1.0), true},
+		{complex64(0.0), false},
+		{true, true},
+		{false, false},
+		{[2]int{1, 2}, true},
+		{[0]int{}, false},
+		{[]byte("abc"), true},
+		{[]byte(""), false},
+		{map[string]int{"a": 1, "b": 2}, true},
+		{map[string]int{}, false},
+		{make(chan int), true},
+		{nil_chan, false},
+		{new(int), true},
+		{nil_ptr, false},
+		{unsafe.Pointer(new(int)), true},
+		{unsafe.Pointer(nil_ptr), false},
+	}
+	for _, test_case := range tests {
+		got, _ := IsTrue(test_case.v)
+		if got != test_case.want {
+			t.Fatalf("expect result %v, got %v", test_case.want, got)
+		}
 	}
 }
 

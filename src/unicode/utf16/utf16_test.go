@@ -6,7 +6,7 @@ package utf16_test
 
 import (
 	"internal/testenv"
-	"reflect"
+	"slices"
 	"testing"
 	"unicode"
 	. "unicode/utf16"
@@ -58,8 +58,23 @@ var encodeTests = []encodeTest{
 func TestEncode(t *testing.T) {
 	for _, tt := range encodeTests {
 		out := Encode(tt.in)
-		if !reflect.DeepEqual(out, tt.out) {
+		if !slices.Equal(out, tt.out) {
 			t.Errorf("Encode(%x) = %x; want %x", tt.in, out, tt.out)
+		}
+	}
+}
+
+func TestEncodeCapacity(t *testing.T) {
+	for _, tt := range []struct {
+		in   []rune
+		want int
+	}{
+		{[]rune{MaxRune + 1}, 1},
+		{[]rune{MaxRune}, 2},
+	} {
+		out := Encode(tt.in)
+		if cap(out) != tt.want {
+			t.Errorf("cap(Encode(%x)) = %d; want %d", tt.in, cap(out), tt.want)
 		}
 	}
 }
@@ -70,7 +85,7 @@ func TestAppendRune(t *testing.T) {
 		for _, u := range tt.in {
 			out = AppendRune(out, u)
 		}
-		if !reflect.DeepEqual(out, tt.out) {
+		if !slices.Equal(out, tt.out) {
 			t.Errorf("AppendRune(%x) = %x; want %x", tt.in, out, tt.out)
 		}
 	}
@@ -143,7 +158,7 @@ func TestAllocationsDecode(t *testing.T) {
 func TestDecode(t *testing.T) {
 	for _, tt := range decodeTests {
 		out := Decode(tt.in)
-		if !reflect.DeepEqual(out, tt.out) {
+		if !slices.Equal(out, tt.out) {
 			t.Errorf("Decode(%x) = %x; want %x", tt.in, out, tt.out)
 		}
 	}
@@ -237,6 +252,13 @@ func BenchmarkEncodeValidASCII(b *testing.B) {
 
 func BenchmarkEncodeValidJapaneseChars(b *testing.B) {
 	data := []rune{'日', '本', '語'}
+	for i := 0; i < b.N; i++ {
+		Encode(data)
+	}
+}
+
+func BenchmarkEncodeMixedRunes(b *testing.B) {
+	data := []rune{'h', 'e', '日', MaxRune + 1, '本', '語', MaxRune + 1, MaxRune + 2, 'b', 'e', 'n'}
 	for i := 0; i < b.N; i++ {
 		Encode(data)
 	}

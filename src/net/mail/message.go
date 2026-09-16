@@ -81,7 +81,7 @@ func readHeader(r *textproto.Reader) (map[string][]string, error) {
 		if err != nil {
 			return m, err
 		}
-		return m, errors.New("malformed initial line: " + line)
+		return m, fmt.Errorf("malformed initial line: %q", line)
 	}
 
 	for {
@@ -93,7 +93,7 @@ func readHeader(r *textproto.Reader) (map[string][]string, error) {
 		// Key ends at first colon.
 		k, v, ok := strings.Cut(kv, ":")
 		if !ok {
-			return m, errors.New("malformed header line: " + kv)
+			return m, fmt.Errorf("malformed header line: %q", kv)
 		}
 		key := textproto.CanonicalMIMEHeaderKey(k)
 
@@ -115,12 +115,7 @@ func readHeader(r *textproto.Reader) (map[string][]string, error) {
 
 // Layouts suitable for passing to time.Parse.
 // These are tried in order.
-var (
-	dateLayoutsBuildOnce sync.Once
-	dateLayouts          []string
-)
-
-func buildDateLayouts() {
+var dateLayouts = sync.OnceValue(func() []string {
 	// Generate layouts based on RFC 5322, section 3.3.
 
 	dows := [...]string{"", "Mon, "}   // day-of-week
@@ -130,23 +125,27 @@ func buildDateLayouts() {
 	// "-0700 (MST)" is not in RFC 5322, but is common.
 	zones := [...]string{"-0700", "MST", "UT"} // zone = (("+" / "-") 4DIGIT) / "UT" / "GMT" / ...
 
+	total := len(dows) * len(days) * len(years) * len(seconds) * len(zones)
+	layouts := make([]string, 0, total)
+
 	for _, dow := range dows {
 		for _, day := range days {
 			for _, year := range years {
 				for _, second := range seconds {
 					for _, zone := range zones {
 						s := dow + day + " Jan " + year + " 15:04" + second + " " + zone
-						dateLayouts = append(dateLayouts, s)
+						layouts = append(layouts, s)
 					}
 				}
 			}
 		}
 	}
-}
+
+	return layouts
+})
 
 // ParseDate parses an RFC 5322 date string.
 func ParseDate(date string) (time.Time, error) {
-	dateLayoutsBuildOnce.Do(buildDateLayouts)
 	// CR and LF must match and are tolerated anywhere in the date field.
 	date = strings.ReplaceAll(date, "\r\n", "")
 	if strings.Contains(date, "\r") {
@@ -184,7 +183,7 @@ func ParseDate(date string) (time.Time, error) {
 	if !p.skipCFWS() {
 		return time.Time{}, errors.New("mail: misformatted parenthetical comment")
 	}
-	for _, layout := range dateLayouts {
+	for _, layout := range dateLayouts() {
 		t, err := time.Parse(layout, date)
 		if err == nil {
 			return t, nil
@@ -322,7 +321,7 @@ func (a *Address) String() string {
 	// Text in an encoded-word in a display-name must not contain certain
 	// characters like quotes or parentheses (see RFC 2047 section 5.3).
 	// When this is the case encode the name using base64 encoding.
-	if strings.ContainsAny(a.Name, "\"#$%&'(),.:;<>@[]^`{|}~") {
+	if strings.ContainsAny(a.Name, "\\\"#$%&'(),.:;<>@[]^`{|}~") {
 		return mime.BEncoding.Encode("utf-8", a.Name) + " " + s
 	}
 	return mime.QEncoding.Encode("utf-8", a.Name) + " " + s
@@ -576,8 +575,10 @@ func (p *addrParser) consumeAddrSpec() (spec string, err error) {
 func (p *addrParser) consumePhrase() (phrase string, err error) {
 	debug.Printf("consumePhrase: [%s]", p.s)
 	// phrase = 1*word
-	var words []string
-	var isPrevEncoded bool
+	var (
+		words []string
+		sb    strings.Builder
+	)
 	for {
 		// obs-phrase allows CFWS after one word
 		if len(words) > 0 {
@@ -609,13 +610,22 @@ func (p *addrParser) consumePhrase() (phrase string, err error) {
 			break
 		}
 		debug.Printf("consumePhrase: consumed %q", word)
-		if isPrevEncoded && isEncoded {
-			words[len(words)-1] += word
-		} else {
+		switch {
+		case isEncoded:
+			sb.WriteString(word)
+		case !isEncoded && sb.Len() > 0:
+			words = append(words, sb.String())
+			sb.Reset()
+			words = append(words, word)
+		default:
 			words = append(words, word)
 		}
-		isPrevEncoded = isEncoded
 	}
+
+	if sb.Len() > 0 {
+		words = append(words, sb.String())
+	}
+
 	// Ignore any error if we got at least one word.
 	if err != nil && len(words) == 0 {
 		debug.Printf("consumePhrase: hit err: %v", err)
@@ -725,7 +735,8 @@ func (p *addrParser) consumeDomainLiteral() (string, error) {
 	}
 
 	// Parse the dtext
-	var dtext string
+	dtext := p.s
+	dtextLen := 0
 	for {
 		if p.empty() {
 			return "", errors.New("mail: unclosed domain-literal")
@@ -742,9 +753,10 @@ func (p *addrParser) consumeDomainLiteral() (string, error) {
 			return "", fmt.Errorf("mail: bad character in domain-literal: %q", r)
 		}
 
-		dtext += p.s[:size]
+		dtextLen += size
 		p.s = p.s[size:]
 	}
+	dtext = dtext[:dtextLen]
 
 	// Skip the trailing ]
 	if !p.consume(']') {
@@ -752,7 +764,12 @@ func (p *addrParser) consumeDomainLiteral() (string, error) {
 	}
 
 	// Check if the domain literal is an IP address
-	if net.ParseIP(dtext) == nil {
+	if addr, ok := strings.CutPrefix(dtext, "IPv6:"); ok {
+		if len(net.ParseIP(addr)) != net.IPv6len {
+			return "", fmt.Errorf("mail: invalid IPv6 address in domain-literal: %q", dtext)
+		}
+
+	} else if net.ParseIP(dtext).To4() == nil {
 		return "", fmt.Errorf("mail: invalid IP address in domain-literal: %q", dtext)
 	}
 
@@ -831,7 +848,7 @@ func (p *addrParser) consumeComment() (string, bool) {
 	// '(' already consumed.
 	depth := 1
 
-	var comment string
+	var comment strings.Builder
 	for {
 		if p.empty() || depth == 0 {
 			break
@@ -845,12 +862,12 @@ func (p *addrParser) consumeComment() (string, bool) {
 			depth--
 		}
 		if depth > 0 {
-			comment += p.s[:1]
+			comment.WriteByte(p.s[0])
 		}
 		p.s = p.s[1:]
 	}
 
-	return comment, depth == 0
+	return comment.String(), depth == 0
 }
 
 func (p *addrParser) decodeRFC2047Word(s string) (word string, isEncoded bool, err error) {

@@ -12,16 +12,18 @@ import (
 	"internal/testenv"
 	"internal/trace"
 	"internal/trace/testtrace"
+	"internal/trace/version"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
 
 func TestTraceAnnotations(t *testing.T) {
-	testTraceProg(t, "annotations.go", func(t *testing.T, tb, _ []byte, _ bool) {
+	testTraceProg(t, "annotations.go", func(t *testing.T, tb, _ []byte, _ string) {
 		type evDesc struct {
 			kind trace.EventKind
 			task trace.TaskID
@@ -96,7 +98,7 @@ func TestTraceCgoCallback(t *testing.T) {
 }
 
 func TestTraceCPUProfile(t *testing.T) {
-	testTraceProg(t, "cpu-profile.go", func(t *testing.T, tb, stderr []byte, _ bool) {
+	testTraceProg(t, "cpu-profile.go", func(t *testing.T, tb, stderr []byte, _ string) {
 		// Parse stderr which has a CPU profile summary, if everything went well.
 		// (If it didn't, we shouldn't even make it here.)
 		scanner := bufio.NewScanner(bytes.NewReader(stderr))
@@ -148,12 +150,11 @@ func TestTraceCPUProfile(t *testing.T) {
 				if hogRegion != nil && ev.Goroutine() == hogRegion.Goroutine() {
 					traceSamples++
 					var fns []string
-					ev.Stack().Frames(func(frame trace.StackFrame) bool {
+					for frame := range ev.Stack().Frames() {
 						if frame.Func != "runtime.goexit" {
 							fns = append(fns, fmt.Sprintf("%s:%d", frame.Func, frame.Line))
 						}
-						return true
-					})
+					}
 					stack := strings.Join(fns, "|")
 					traceStacks[stack]++
 				}
@@ -210,7 +211,7 @@ func TestTraceCPUProfile(t *testing.T) {
 }
 
 func TestTraceFutileWakeup(t *testing.T) {
-	testTraceProg(t, "futile-wakeup.go", func(t *testing.T, tb, _ []byte, _ bool) {
+	testTraceProg(t, "futile-wakeup.go", func(t *testing.T, tb, _ []byte, _ string) {
 		// Check to make sure that no goroutine in the "special" trace region
 		// ends up blocking, unblocking, then immediately blocking again.
 		//
@@ -311,7 +312,7 @@ func TestTraceGOMAXPROCS(t *testing.T) {
 }
 
 func TestTraceStacks(t *testing.T) {
-	testTraceProg(t, "stacks.go", func(t *testing.T, tb, _ []byte, stress bool) {
+	testTraceProg(t, "stacks.go", func(t *testing.T, tb, _ []byte, godebug string) {
 		type frame struct {
 			fn   string
 			line int
@@ -325,7 +326,8 @@ func TestTraceStacks(t *testing.T) {
 		const mainLine = 21
 		want := []evDesc{
 			{trace.EventStateTransition, "Goroutine Running->Runnable", []frame{
-				{"main.main", mainLine + 82},
+				{"runtime.Gosched", 0},
+				{"main.main", mainLine + 87},
 			}},
 			{trace.EventStateTransition, "Goroutine NotExist->Runnable", []frame{
 				{"main.main", mainLine + 11},
@@ -348,7 +350,7 @@ func TestTraceStacks(t *testing.T) {
 			}},
 			{trace.EventStateTransition, "Goroutine Waiting->Runnable", []frame{
 				{"runtime.chansend1", 0},
-				{"main.main", mainLine + 84},
+				{"main.main", mainLine + 89},
 			}},
 			{trace.EventStateTransition, "Goroutine Running->Waiting", []frame{
 				{"runtime.chansend1", 0},
@@ -356,7 +358,7 @@ func TestTraceStacks(t *testing.T) {
 			}},
 			{trace.EventStateTransition, "Goroutine Waiting->Runnable", []frame{
 				{"runtime.chanrecv1", 0},
-				{"main.main", mainLine + 85},
+				{"main.main", mainLine + 90},
 			}},
 			{trace.EventStateTransition, "Goroutine Running->Waiting", []frame{
 				{"runtime.selectgo", 0},
@@ -364,7 +366,7 @@ func TestTraceStacks(t *testing.T) {
 			}},
 			{trace.EventStateTransition, "Goroutine Waiting->Runnable", []frame{
 				{"runtime.selectgo", 0},
-				{"main.main", mainLine + 86},
+				{"main.main", mainLine + 91},
 			}},
 			{trace.EventStateTransition, "Goroutine Running->Waiting", []frame{
 				{"sync.(*Mutex).Lock", 0},
@@ -381,7 +383,7 @@ func TestTraceStacks(t *testing.T) {
 			{trace.EventStateTransition, "Goroutine Waiting->Runnable", []frame{
 				{"sync.(*WaitGroup).Add", 0},
 				{"sync.(*WaitGroup).Done", 0},
-				{"main.main", mainLine + 91},
+				{"main.main", mainLine + 96},
 			}},
 			{trace.EventStateTransition, "Goroutine Running->Waiting", []frame{
 				{"sync.(*Cond).Wait", 0},
@@ -402,6 +404,18 @@ func TestTraceStacks(t *testing.T) {
 				{"main.main", 0},
 			}},
 		}
+		asyncPreemptOff := strings.Contains(godebug, "asyncpreemptoff=1")
+		if asyncPreemptOff {
+			// Only check for syncPreemptPoint if asynchronous preemption is disabled.
+			// Otherwise, the syncPreemptPoint goroutine might be exclusively async
+			// preempted, causing this test to flake.
+			syncPreemptEv := evDesc{trace.EventStateTransition, "Goroutine Running->Runnable", []frame{
+				{"main.syncPreemptPoint", 0},
+				{"main.main.func12", 0},
+			}}
+			want = append(want, syncPreemptEv)
+		}
+		stress := strings.Contains(godebug, "traceadvanceperiod=0")
 		if !stress {
 			// Only check for this stack if !stress because traceAdvance alone could
 			// allocate enough memory to trigger a GC if called frequently enough.
@@ -434,23 +448,20 @@ func TestTraceStacks(t *testing.T) {
 					{"main.main.func11", 0},
 				}},
 			}...)
+			if runtime.GOOS == "darwin" {
+				want[len(want)-1].frames = append([]frame{{"syscall.syscall", 0}}, want[len(want)-1].frames...)
+			}
 		}
 		stackMatches := func(stk trace.Stack, frames []frame) bool {
-			i := 0
-			match := true
-			stk.Frames(func(f trace.StackFrame) bool {
+			for i, f := range slices.Collect(stk.Frames()) {
 				if f.Func != frames[i].fn {
-					match = false
 					return false
 				}
 				if line := uint64(frames[i].line); line != 0 && line != f.Line {
-					match = false
 					return false
 				}
-				i++
-				return true
-			})
-			return match
+			}
+			return true
 		}
 		r, err := trace.NewReader(bytes.NewReader(tb))
 		if err != nil {
@@ -507,7 +518,7 @@ func TestTraceStress(t *testing.T) {
 	case "js", "wasip1":
 		t.Skip("no os.Pipe on " + runtime.GOOS)
 	}
-	testTraceProg(t, "stress.go", nil)
+	testTraceProg(t, "stress.go", checkReaderDeterminism)
 }
 
 func TestTraceStressStartStop(t *testing.T) {
@@ -535,23 +546,81 @@ func TestTraceIterPull(t *testing.T) {
 	testTraceProg(t, "iter-pull.go", nil)
 }
 
-func testTraceProg(t *testing.T, progName string, extra func(t *testing.T, trace, stderr []byte, stress bool)) {
+func checkReaderDeterminism(t *testing.T, tb, _ []byte, _ string) {
+	events := func() []trace.Event {
+		var evs []trace.Event
+
+		r, err := trace.NewReader(bytes.NewReader(tb))
+		if err != nil {
+			t.Error(err)
+		}
+		for {
+			ev, err := r.ReadEvent()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			evs = append(evs, ev)
+		}
+
+		return evs
+	}
+
+	evs1 := events()
+	evs2 := events()
+
+	if l1, l2 := len(evs1), len(evs2); l1 != l2 {
+		t.Fatalf("re-reading trace gives different event count (%d != %d)", l1, l2)
+	}
+	for i, ev1 := range evs1 {
+		ev2 := evs2[i]
+		if s1, s2 := ev1.String(), ev2.String(); s1 != s2 {
+			t.Errorf("re-reading trace gives different event %d:\n%s\n%s\n", i, s1, s2)
+			break
+		}
+	}
+}
+
+func testTraceProg(t *testing.T, progName string, extra func(t *testing.T, trace, stderr []byte, godebug string)) {
 	testenv.MustHaveGoRun(t)
 
 	// Check if we're on a builder.
 	onBuilder := testenv.Builder() != ""
 	onOldBuilder := !strings.Contains(testenv.Builder(), "gotip") && !strings.Contains(testenv.Builder(), "go1")
 
+	if progName == "cgo-callback.go" && onBuilder && !onOldBuilder &&
+		runtime.GOOS == "freebsd" && runtime.GOARCH == "amd64" && race.Enabled {
+		t.Skip("test fails on freebsd-amd64-race in LUCI; see go.dev/issue/71556")
+	}
+
 	testPath := filepath.Join("./testdata/testprog", progName)
 	testName := progName
 	runTest := func(t *testing.T, stress bool, extraGODEBUG string) {
-		// Run the program and capture the trace, which is always written to stdout.
-		cmd := testenv.Command(t, testenv.GoToolPath(t), "run")
-		if race.Enabled {
-			cmd.Args = append(cmd.Args, "-race")
+		// Build the program.
+		binFile, err := os.CreateTemp("", progName)
+		if err != nil {
+			t.Fatalf("failed to create temporary output file: %v", err)
 		}
-		cmd.Args = append(cmd.Args, testPath)
-		cmd.Env = append(os.Environ(), "GOEXPERIMENT=rangefunc")
+		bin := binFile.Name()
+		binFile.Close()
+		t.Cleanup(func() {
+			os.Remove(bin)
+		})
+		buildCmd := testenv.CommandContext(t, t.Context(), testenv.GoToolPath(t), "build", "-o", bin)
+		if race.Enabled {
+			buildCmd.Args = append(buildCmd.Args, "-race")
+		}
+		buildCmd.Args = append(buildCmd.Args, testPath)
+		buildOutput, err := buildCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("failed to build %s: %v: output:\n%s", testPath, err, buildOutput)
+		}
+
+		// Run the program and capture the trace, which is always written to stdout.
+		cmd := testenv.CommandContext(t, t.Context(), bin)
+
 		// Add a stack ownership check. This is cheap enough for testing.
 		godebug := "tracecheckstackownership=1"
 		if stress {
@@ -563,6 +632,10 @@ func testTraceProg(t *testing.T, progName string, extra func(t *testing.T, trace
 			godebug += "," + extraGODEBUG
 		}
 		cmd.Env = append(cmd.Env, "GODEBUG="+godebug)
+		if _, ok := os.LookupEnv("GOTRACEBACK"); !ok {
+			// Unless overridden, set GOTRACEBACK=crash.
+			cmd.Env = append(cmd.Env, "GOTRACEBACK=crash")
+		}
 
 		// Capture stdout and stderr.
 		//
@@ -581,38 +654,41 @@ func testTraceProg(t *testing.T, progName string, extra func(t *testing.T, trace
 		tb := traceBuf.Bytes()
 
 		// Test the trace and the parser.
-		testReader(t, bytes.NewReader(tb), testtrace.ExpectSuccess())
+		v := testtrace.NewValidator()
+		v.GoVersion = version.Current
+		if runtime.GOOS == "windows" && stress {
+			// Under stress mode we're constantly advancing trace generations.
+			// Windows' clock granularity is too coarse to guarantee monotonic
+			// timestamps for monotonic and wall clock time in this case, so
+			// skip the checks.
+			v.SkipClockSnapshotChecks()
+		}
+		testReader(t, bytes.NewReader(tb), v, testtrace.ExpectSuccess())
 
 		// Run some extra validation.
 		if !t.Failed() && extra != nil {
-			extra(t, tb, errBuf.Bytes(), stress)
+			extra(t, tb, errBuf.Bytes(), godebug)
 		}
 
 		// Dump some more information on failure.
-		if t.Failed() && onBuilder {
-			// Dump directly to the test log on the builder, since this
-			// data is critical for debugging and this is the only way
-			// we can currently make sure it's retained.
-			t.Log("found bad trace; dumping to test log...")
-			s := dumpTraceToText(t, tb)
-			if onOldBuilder && len(s) > 1<<20+512<<10 {
-				// The old build infrastructure truncates logs at ~2 MiB.
-				// Let's assume we're the only failure and give ourselves
-				// up to 1.5 MiB to dump the trace.
-				//
-				// TODO(mknyszek): Remove this when we've migrated off of
-				// the old infrastructure.
-				t.Logf("text trace too large to dump (%d bytes)", len(s))
-			} else {
-				t.Log(s)
+		if t.Failed() || *dumpTraces {
+			suffix := func(stress bool) string {
+				if stress {
+					return "stress"
+				}
+				return "default"
 			}
-		} else if t.Failed() || *dumpTraces {
-			// We asked to dump the trace or failed. Write the trace to a file.
-			t.Logf("wrote trace to file: %s", dumpTraceToFile(t, testName, stress, tb))
+			testtrace.Dump(t, fmt.Sprintf("%s.%s", testName, suffix(stress)), tb, *dumpTraces)
 		}
 	}
 	t.Run("Default", func(t *testing.T) {
 		runTest(t, false, "")
+	})
+	t.Run("AsyncPreemptOff", func(t *testing.T) {
+		if testing.Short() && runtime.NumCPU() < 2 {
+			t.Skip("skipping trace async preempt off tests in short mode")
+		}
+		runTest(t, false, "asyncpreemptoff=1")
 	})
 	t.Run("Stress", func(t *testing.T) {
 		if testing.Short() {
@@ -621,6 +697,9 @@ func testTraceProg(t *testing.T, progName string, extra func(t *testing.T, trace
 		runTest(t, true, "")
 	})
 	t.Run("AllocFree", func(t *testing.T) {
+		if !*allocFree {
+			t.Skip("skipping trace alloc/free tests by default; too flaky (see go.dev/issue/70838)")
+		}
 		if testing.Short() {
 			t.Skip("skipping trace alloc/free tests in short mode")
 		}

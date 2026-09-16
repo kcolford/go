@@ -6,6 +6,7 @@ package slog
 
 import (
 	"fmt"
+	"internal/asan"
 	"reflect"
 	"strings"
 	"testing"
@@ -86,6 +87,10 @@ func TestValueString(t *testing.T) {
 }
 
 func TestValueNoAlloc(t *testing.T) {
+	if asan.Enabled {
+		t.Skip("test allocates more with -asan; see #70079")
+	}
+
 	// Assign values just to make sure the compiler doesn't optimize away the statements.
 	var (
 		i  int64
@@ -284,9 +289,8 @@ func BenchmarkUnsafeStrings(b *testing.B) {
 	for i := range src {
 		src[i] = StringValue(fmt.Sprintf("string#%d", i))
 	}
-	b.ResetTimer()
 	var d string
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		copy(dst, src)
 		for _, a := range dst {
 			d = a.String()

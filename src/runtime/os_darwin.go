@@ -6,6 +6,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/stringslite"
 	"unsafe"
 )
 
@@ -143,10 +144,11 @@ func osinit() {
 	// pthread_create delayed until end of goenvs so that we
 	// can look at the environment first.
 
-	ncpu = getncpu()
+	numCPUStartup = getCPUCount()
 	physPageSize = getPageSize()
 
 	osinit_hack()
+	initWorkingDir()
 }
 
 func sysctlbynameInt32(name []byte) (int32, int32) {
@@ -156,9 +158,20 @@ func sysctlbynameInt32(name []byte) (int32, int32) {
 	return ret, out
 }
 
-//go:linkname internal_cpu_getsysctlbyname internal/cpu.getsysctlbyname
-func internal_cpu_getsysctlbyname(name []byte) (int32, int32) {
+func sysctlbynameBytes(name, out []byte) int32 {
+	nout := uintptr(len(out))
+	ret := sysctlbyname(&name[0], &out[0], &nout, nil, 0)
+	return ret
+}
+
+//go:linkname internal_cpu_sysctlbynameInt32 internal/cpu.sysctlbynameInt32
+func internal_cpu_sysctlbynameInt32(name []byte) (int32, int32) {
 	return sysctlbynameInt32(name)
+}
+
+//go:linkname internal_cpu_sysctlbynameBytes internal/cpu.sysctlbynameBytes
+func internal_cpu_sysctlbynameBytes(name, out []byte) int32 {
+	return sysctlbynameBytes(name, out)
 }
 
 const (
@@ -167,7 +180,7 @@ const (
 	_HW_PAGESIZE = 7
 )
 
-func getncpu() int32 {
+func getCPUCount() int32 {
 	// Use sysctl to fetch hw.ncpu.
 	mib := [2]uint32{_CTL_HW, _HW_NCPU}
 	out := uint32(0)
@@ -191,14 +204,10 @@ func getPageSize() uintptr {
 	return 0
 }
 
-var urandom_dev = []byte("/dev/urandom\x00")
-
 //go:nosplit
 func readRandom(r []byte) int {
-	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
-	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
-	closefd(fd)
-	return int(n)
+	arc4random_buf(unsafe.Pointer(&r[0]), int32(len(r)))
+	return len(r)
 }
 
 func goenvs() {
@@ -260,7 +269,7 @@ func mstart_stub()
 // This function is not safe to use after initialization as it does not pass an M as fnarg.
 //
 //go:nosplit
-func newosproc0(stacksize uintptr, fn uintptr) {
+func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
 	// Initialize an attribute object.
 	var attr pthreadattr
 	var err int32
@@ -292,7 +301,7 @@ func newosproc0(stacksize uintptr, fn uintptr) {
 	// setup and then calls mstart.
 	var oset sigset
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
-	err = pthread_create(&attr, fn, nil)
+	err = pthread_create(&attr, uintptr(fn), nil)
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 	if err != 0 {
 		writeErrStr(failthreadcreate)
@@ -347,8 +356,12 @@ func unminit() {
 	getg().m.procid = 0
 }
 
-// Called from exitm, but not from drop, to undo the effect of thread-owned
+// Called from mexit, but not from dropm, to undo the effect of thread-owned
 // resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+//
+// This always runs without a P, so //go:nowritebarrierrec is required.
+//
+//go:nowritebarrierrec
 func mdestroy(mp *m) {
 }
 
@@ -381,7 +394,12 @@ var sigset_all = ^sigset(0)
 //go:nowritebarrierrec
 func setsig(i uint32, fn uintptr) {
 	var sa usigactiont
-	sa.sa_flags = _SA_SIGINFO | _SA_ONSTACK | _SA_RESTART
+
+	sa.sa_flags = _SA_ONSTACK | _SA_RESTART
+	// SA_SIGINFO should not be set when assigning SIG_DFL or SIG_IGN
+	if fn != _SIG_DFL && fn != _SIG_IGN {
+		sa.sa_flags |= _SA_SIGINFO
+	}
 	sa.sa_mask = ^uint32(0)
 	if fn == abi.FuncPCABIInternal(sighandler) { // abi.FuncPCABIInternal(sighandler) matches the callers in signal_unix.go
 		if iscgo {
@@ -465,10 +483,7 @@ func sysargs(argc int32, argv **byte) {
 	executablePath = gostringnocopy(argv_index(argv, n+1))
 
 	// strip "executable_path=" prefix if available, it's added after OS X 10.11.
-	const prefix = "executable_path="
-	if len(executablePath) > len(prefix) && executablePath[:len(prefix)] == prefix {
-		executablePath = executablePath[len(prefix):]
-	}
+	executablePath = stringslite.TrimPrefix(executablePath, "executable_path=")
 }
 
 func signalM(mp *m, sig int) {

@@ -7,6 +7,7 @@ package runtime_test
 import (
 	"encoding/binary"
 	"fmt"
+	"internal/byteorder"
 	"internal/race"
 	"internal/testenv"
 	"math"
@@ -19,8 +20,19 @@ import (
 	"unsafe"
 )
 
+// Test that unalgined access to memhash32 doesn't cause a problem.
+func TestMemHash32AlignAccess(t *testing.T) {
+	type Key struct {
+		_ [1]byte
+		k [4]byte
+		_ [3]byte
+	}
+	key := Key{}
+	sink = (uint64)(MemHash32(unsafe.Pointer(&key.k), 0))
+}
+
 func TestMemHash32Equality(t *testing.T) {
-	if *UseAeshash {
+	if *MinAeshashSize <= 4 {
 		t.Skip("skipping since AES hash implementation is used")
 	}
 	var b [4]byte
@@ -36,8 +48,19 @@ func TestMemHash32Equality(t *testing.T) {
 	}
 }
 
+// Test that unalgined access to memhash64 doesn't cause a problem.
+func TestMemHash64AlignAccess(t *testing.T) {
+	type Key struct {
+		_ [1]byte
+		k [8]byte
+		_ [7]byte
+	}
+	key := Key{}
+	sink = (uint64)(MemHash64(unsafe.Pointer(&key.k), 0))
+}
+
 func TestMemHash64Equality(t *testing.T) {
-	if *UseAeshash {
+	if *MinAeshashSize <= 8 {
 		t.Skip("skipping since AES hash implementation is used")
 	}
 	var b [8]byte
@@ -326,10 +349,7 @@ func genPerm(h *HashSet, b []byte, s []uint32, n int) {
 		return
 	}
 	for _, v := range s {
-		b[n] = byte(v)
-		b[n+1] = byte(v >> 8)
-		b[n+2] = byte(v >> 16)
-		b[n+3] = byte(v >> 24)
+		byteorder.LEPutUint32(b[n:], v)
 		genPerm(h, b, s, n+4)
 	}
 }
@@ -638,11 +658,10 @@ func TestSmhasherSeed(t *testing.T) {
 }
 
 func TestIssue66841(t *testing.T) {
-	testenv.MustHaveExec(t)
-	if *UseAeshash && os.Getenv("TEST_ISSUE_66841") == "" {
+	if AeshashEnabled() && os.Getenv("TEST_ISSUE_66841") == "" {
 		// We want to test the backup hash, so if we're running on a machine
 		// that uses aeshash, exec ourselves while turning aes off.
-		cmd := testenv.CleanCmdEnv(testenv.Command(t, os.Args[0], "-test.run=^TestIssue66841$"))
+		cmd := testenv.CleanCmdEnv(testenv.Command(t, testenv.Executable(t), "-test.run=^TestIssue66841$"))
 		cmd.Env = append(cmd.Env, "GODEBUG=cpu.aes=off", "TEST_ISSUE_66841=1")
 		out, err := cmd.CombinedOutput()
 		if err != nil {

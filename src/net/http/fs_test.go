@@ -24,9 +24,9 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -52,6 +52,9 @@ var ServeFileRangeTests = []struct {
 	{r: "bytes=0-4", code: StatusPartialContent, ranges: []wantRange{{0, 5}}},
 	{r: "bytes=2-", code: StatusPartialContent, ranges: []wantRange{{2, testFileLen}}},
 	{r: "bytes=-5", code: StatusPartialContent, ranges: []wantRange{{testFileLen - 5, testFileLen}}},
+	{r: "Bytes=0-4", code: StatusPartialContent, ranges: []wantRange{{0, 5}}},
+	{r: "BYTES=2-", code: StatusPartialContent, ranges: []wantRange{{2, testFileLen}}},
+	{r: "bYtEs=-5", code: StatusPartialContent, ranges: []wantRange{{testFileLen - 5, testFileLen}}},
 	{r: "bytes=3-7", code: StatusPartialContent, ranges: []wantRange{{3, 8}}},
 	{r: "bytes=0-0,-2", code: StatusPartialContent, ranges: []wantRange{{0, 1}, {testFileLen - 2, testFileLen}}},
 	{r: "bytes=0-1,5-8", code: StatusPartialContent, ranges: []wantRange{{0, 2}, {5, 9}}},
@@ -269,10 +272,19 @@ func TestServeContentWithEmptyContentIgnoreRanges(t *testing.T) {
 
 var fsRedirectTestData = []struct {
 	original, redirect string
+	status             int
 }{
-	{"/test/index.html", "/test/"},
-	{"/test/testdata", "/test/testdata/"},
-	{"/test/testdata/file/", "/test/testdata/file"},
+	{"/test/index.html", "/test/", 200},
+	{"/test/testdata", "/test/testdata/", 200},
+	{"/test/testdata/file/", "/test/testdata/file", 200},
+	// Redirect attempts for path with escaped slashes should result in 404.
+	// However, escaped paths are okay if they do not trigger a redirect.
+	// See https://go.dev/issue/80289.
+	{"/test%2ftestdata", "/test/testdata", 404},
+	{"/test/testdata%2ffile/", "/test/testdata/file/", 404},
+	{"/test/testdata%2Findex.html", "/test/testdata/index.html", 404},
+	{"/test/testdata%2ffile", "/test/testdata/file", 200},
+	{"/test/testdata%2F", "/test/testdata/", 200},
 }
 
 func TestFSRedirect(t *testing.T) { run(t, testFSRedirect) }
@@ -287,6 +299,9 @@ func testFSRedirect(t *testing.T, mode testMode) {
 		res.Body.Close()
 		if g, e := res.Request.URL.Path, data.redirect; g != e {
 			t.Errorf("redirect from %s: got %s, want %s", data.original, g, e)
+		}
+		if res.StatusCode != data.status {
+			t.Errorf("redirect from %s: got status %d, want %d", data.original, res.StatusCode, data.status)
 		}
 	}
 }
@@ -326,7 +341,7 @@ func TestFileServerCleans(t *testing.T) {
 
 func TestFileServerEscapesNames(t *testing.T) { run(t, testFileServerEscapesNames) }
 func testFileServerEscapesNames(t *testing.T, mode testMode) {
-	const dirListPrefix = "<!doctype html>\n<meta name=\"viewport\" content=\"width=device-width\">\n<pre>\n"
+	const dirListPrefix = "<!doctype html>\n<meta name=\"viewport\" content=\"width=device-width\">\n<meta name=\"color-scheme\" content=\"light dark\">\n<pre>\n"
 	const dirListSuffix = "\n</pre>\n"
 	tests := []struct {
 		name, escaped string
@@ -516,7 +531,7 @@ func testServeFileContentType(t *testing.T, mode testMode) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if h := resp.Header["Content-Type"]; !reflect.DeepEqual(h, want) {
+		if h := resp.Header["Content-Type"]; !slices.Equal(h, want) {
 			t.Errorf("Content-Type mismatch: got %v, want %v", h, want)
 		}
 		resp.Body.Close()
@@ -711,25 +726,43 @@ func testServeIndexHtmlFS(t *testing.T, mode testMode) {
 
 func TestFileServerZeroByte(t *testing.T) { run(t, testFileServerZeroByte) }
 func testFileServerZeroByte(t *testing.T, mode testMode) {
-	ts := newClientServerTest(t, mode, FileServer(Dir("."))).ts
+	cst := newClientServerTest(t, mode, FileServer(Dir(".")))
 
-	c, err := net.Dial("tcp", ts.Listener.Addr().String())
+	req, err := NewRequest("GET", cst.ts.URL, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-	_, err = fmt.Fprintf(c, "GET /..\x00 HTTP/1.0\r\n\r\n")
+	req.URL.Path = "/..\x00"
+
+	res, err := cst.c.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got bytes.Buffer
-	bufr := bufio.NewReader(io.TeeReader(c, &got))
-	res, err := ReadResponse(bufr, nil)
-	if err != nil {
-		t.Fatal("ReadResponse: ", err)
-	}
+	defer res.Body.Close()
+
 	if res.StatusCode == 200 {
-		t.Errorf("got status 200; want an error. Body is:\n%s", got.Bytes())
+		t.Errorf("got status 200; want an error")
+	}
+}
+
+func TestFileServerNullByte(t *testing.T) { run(t, testFileServerNullByte) }
+func testFileServerNullByte(t *testing.T, mode testMode) {
+	ts := newClientServerTest(t, mode, FileServer(Dir("testdata"))).ts
+
+	for _, path := range []string{
+		"/file%00",
+		"/%00",
+		"/file/qwe/%00",
+	} {
+		res, err := ts.Client().Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != 404 {
+			t.Errorf("Get(%q): got status %v, want 404", path, res.StatusCode)
+		}
+
 	}
 }
 
@@ -841,8 +874,19 @@ func testDirectoryIfNotModified(t *testing.T, mode testMode) {
 		"/index.html": indexFile,
 	}
 
-	ts := newClientServerTest(t, mode, FileServer(fs)).ts
+	modDone := make(chan struct{})
+	fsHandler := FileServer(fs)
+	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		fsHandler.ServeHTTP(w, r)
+		// After the first "If-Modified-Since" request, advance the /index.html
+		// file's modtime, but not the directory's
+		if r.Header.Get("If-Modified-Since") != "" && indexFile.modtime.Equal(fileMod) {
+			indexFile.modtime = indexFile.modtime.Add(1 * time.Hour)
+			close(modDone)
+		}
+	})).ts
 
+	// Initial fetch of /index.html.
 	res, err := ts.Client().Get(ts.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -855,15 +899,14 @@ func testDirectoryIfNotModified(t *testing.T, mode testMode) {
 		t.Fatalf("Got body %q; want %q", b, indexContents)
 	}
 	res.Body.Close()
-
 	lastMod := res.Header.Get("Last-Modified")
 	if lastMod != fileModStr {
 		t.Fatalf("initial Last-Modified = %q; want %q", lastMod, fileModStr)
 	}
 
+	// Fetch /index.html when it has not been modified.
 	req, _ := NewRequest("GET", ts.URL, nil)
 	req.Header.Set("If-Modified-Since", lastMod)
-
 	c := ts.Client()
 	res, err = c.Do(req)
 	if err != nil {
@@ -874,9 +917,8 @@ func testDirectoryIfNotModified(t *testing.T, mode testMode) {
 	}
 	res.Body.Close()
 
-	// Advance the index.html file's modtime, but not the directory's.
-	indexFile.modtime = indexFile.modtime.Add(1 * time.Hour)
-
+	// Fetch /index.html after it has been modified.
+	<-modDone
 	res, err = c.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -1146,21 +1188,24 @@ func testServeContent(t *testing.T, mode testMode) {
 		},
 	}
 	for testName, tt := range tests {
-		var content io.ReadSeeker
-		if tt.file != "" {
-			f, err := os.Open(tt.file)
-			if err != nil {
-				t.Fatalf("test %q: %v", testName, err)
+		var contentBytes []byte
+		if sr, ok := tt.content.(*strings.Reader); ok {
+			var err error
+			if contentBytes, err = io.ReadAll(sr); err != nil {
+				t.Fatal(err)
 			}
-			defer f.Close()
-			content = f
-		} else {
-			content = tt.content
 		}
 		for _, method := range []string{"GET", "HEAD"} {
-			//restore content in case it is consumed by previous method
-			if content, ok := content.(*strings.Reader); ok {
-				content.Seek(0, io.SeekStart)
+			var content io.ReadSeeker
+			if tt.file != "" {
+				f, err := os.Open(tt.file)
+				if err != nil {
+					t.Fatalf("test %q: %v", testName, err)
+				}
+				defer f.Close()
+				content = f
+			} else {
+				content = strings.NewReader(string(contentBytes))
 			}
 
 			servec <- serveParam{
@@ -1448,7 +1493,7 @@ func TestFileServerCleanPath(t *testing.T) {
 		rr := httptest.NewRecorder()
 		req, _ := NewRequest("GET", "http://foo.localhost"+tt.path, nil)
 		FileServer(fileServerCleanPathDir{&log}).ServeHTTP(rr, req)
-		if !reflect.DeepEqual(log, tt.wantOpen) {
+		if !slices.Equal(log, tt.wantOpen) {
 			t.Logf("For %s: Opens = %q; want %q", tt.path, log, tt.wantOpen)
 		}
 		if rr.Code != tt.wantCode {
@@ -1519,7 +1564,6 @@ func testServeFileRejectsInvalidSuffixLengths(t *testing.T, mode testMode) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.r, func(t *testing.T) {
 			req, err := NewRequest("GET", cst.URL+"/index.html", nil)
 			if err != nil {

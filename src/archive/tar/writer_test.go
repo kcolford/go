@@ -8,12 +8,14 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"internal/obscuretestdata"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
-	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -73,8 +75,9 @@ func TestWriter(t *testing.T) {
 	)
 
 	vectors := []struct {
-		file  string // Optional filename of expected output
-		tests []testFnc
+		file     string // Optional filename of expected output
+		obscured bool   // Whether file is obscured
+		tests    []testFnc
 	}{{
 		// The writer test file was produced with this command:
 		// tar (GNU tar) 1.26
@@ -150,7 +153,8 @@ func TestWriter(t *testing.T) {
 		//  bsdtar -xvf writer-big-long.tar
 		//
 		// This file is in PAX format.
-		file: "testdata/writer-big-long.tar",
+		file:     "testdata/writer-big-long.tar.base64",
+		obscured: true,
 		tests: []testFnc{
 			testHeader{Header{
 				Typeflag: TypeReg,
@@ -392,7 +396,8 @@ func TestWriter(t *testing.T) {
 					testClose{},
 				},
 			}, {
-				file: "testdata/gnu-sparse-big.tar",
+				file:     "testdata/gnu-sparse-big.tar.base64",
+				obscured: true,
 				tests: []testFnc{
 					testHeader{Header{
 						Typeflag: TypeGNUSparse,
@@ -424,7 +429,8 @@ func TestWriter(t *testing.T) {
 					testClose{nil},
 				},
 			}, {
-				file: "testdata/pax-sparse-big.tar",
+				file:     "testdata/pax-sparse-big.tar.base64",
+				obscured: true,
 				tests: []testFnc{
 					testHeader{Header{
 						Typeflag: TypeReg,
@@ -482,7 +488,7 @@ func TestWriter(t *testing.T) {
 		return x == y
 	}
 	for _, v := range vectors {
-		t.Run(path.Base(v.file), func(t *testing.T) {
+		t.Run(strings.TrimSuffix(path.Base(v.file), ".base64"), func(t *testing.T) {
 			const maxSize = 10 << 10 // 10KiB
 			buf := new(bytes.Buffer)
 			tw := NewWriter(iotest.TruncateWriter(buf, maxSize))
@@ -521,7 +527,16 @@ func TestWriter(t *testing.T) {
 			}
 
 			if v.file != "" {
-				want, err := os.ReadFile(v.file)
+				path := v.file
+				if v.obscured {
+					tf, err := obscuretestdata.DecodeToTempFile(path)
+					if err != nil {
+						t.Fatalf("obscuretestdata.DecodeToTempFile(%s): %v", path, err)
+					}
+					path = tf
+				}
+
+				want, err := os.ReadFile(path)
 				if err != nil {
 					t.Fatalf("ReadFile() = %v, want nil", err)
 				}
@@ -702,7 +717,7 @@ func TestPaxXattrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(hdr.Xattrs, xattrs) {
+	if !maps.Equal(hdr.Xattrs, xattrs) {
 		t.Fatalf("xattrs did not survive round trip: got %+v, want %+v",
 			hdr.Xattrs, xattrs)
 	}
@@ -1338,29 +1353,41 @@ func TestFileWriter(t *testing.T) {
 
 func TestWriterAddFS(t *testing.T) {
 	fsys := fstest.MapFS{
+		"emptyfolder":          {Mode: 0o755 | os.ModeDir},
 		"file.go":              {Data: []byte("hello")},
 		"subfolder/another.go": {Data: []byte("world")},
+		"symlink.go":           {Mode: 0o777 | os.ModeSymlink, Data: []byte("file.go")},
+		// Notably missing here is the "subfolder" directory. This makes sure even
+		// if we don't have a subfolder directory listed.
 	}
 	var buf bytes.Buffer
 	tw := NewWriter(&buf)
 	if err := tw.AddFS(fsys); err != nil {
 		t.Fatal(err)
 	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add subfolder into fsys to match what we'll read from the tar.
+	fsys["subfolder"] = &fstest.MapFile{Mode: 0o555 | os.ModeDir}
 
 	// Test that we can get the files back from the archive
 	tr := NewReader(&buf)
 
-	entries, err := fsys.ReadDir(".")
-	if err != nil {
-		t.Fatal(err)
+	names := make([]string, 0, len(fsys))
+	for name := range fsys {
+		names = append(names, name)
 	}
+	sort.Strings(names)
 
-	var curfname string
-	for _, entry := range entries {
-		curfname = entry.Name()
-		if entry.IsDir() {
-			curfname += "/"
-			continue
+	entriesLeft := len(fsys)
+	for _, name := range names {
+		entriesLeft--
+
+		entryInfo, err := fsys.Lstat(name)
+		if err != nil {
+			t.Fatalf("getting entry info error: %v", err)
 		}
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -1370,21 +1397,41 @@ func TestWriterAddFS(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		data, err := io.ReadAll(tr)
-		if err != nil {
-			t.Fatal(err)
+		tmpName := name
+		if entryInfo.IsDir() {
+			tmpName += "/"
+		}
+		if hdr.Name != tmpName {
+			t.Errorf("test fs has filename %v; archive header has %v",
+				name, hdr.Name)
 		}
 
-		if hdr.Name != curfname {
-			t.Fatalf("got filename %v, want %v",
-				curfname, hdr.Name)
+		if entryInfo.Mode() != hdr.FileInfo().Mode() {
+			t.Errorf("%s: test fs has mode %v; archive header has %v",
+				name, entryInfo.Mode(), hdr.FileInfo().Mode())
 		}
 
-		origdata := fsys[curfname].Data
-		if string(data) != string(origdata) {
-			t.Fatalf("got file content %v, want %v",
-				data, origdata)
+		switch entryInfo.Mode().Type() {
+		case fs.ModeDir:
+			// No additional checks necessary.
+		case fs.ModeSymlink:
+			origtarget := string(fsys[name].Data)
+			if hdr.Linkname != origtarget {
+				t.Fatalf("test fs has link content %s; archive header %v", origtarget, hdr.Linkname)
+			}
+		default:
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			origdata := fsys[name].Data
+			if string(data) != string(origdata) {
+				t.Fatalf("test fs has file content %v; archive header has %v", origdata, data)
+			}
 		}
+	}
+	if entriesLeft > 0 {
+		t.Fatalf("not all entries are in the archive")
 	}
 }
 

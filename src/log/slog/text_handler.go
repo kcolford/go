@@ -9,6 +9,7 @@ import (
 	"encoding"
 	"fmt"
 	"io"
+	"log/slog/internal/buffer"
 	"reflect"
 	"strconv"
 	"sync"
@@ -62,9 +63,7 @@ func (h *TextHandler) WithGroup(name string) Handler {
 // Otherwise, the key is "time"
 // and the value is output in RFC3339 format with millisecond precision.
 //
-// If the Record's level is zero, the level is omitted.
-// Otherwise, the key is "level"
-// and the value of [Level.String] is output.
+// The level's key is "level" and its value is the result of calling [Level.String].
 //
 // If the AddSource option is set and source information is available,
 // the key is "source" and the value is output as FILE:LINE.
@@ -102,7 +101,18 @@ func appendTextValue(s *handleState, v Value) error {
 	case KindTime:
 		s.appendTime(v.time())
 	case KindAny:
-		if tm, ok := v.any.(encoding.TextMarshaler); ok {
+		if ta, ok := v.any.(encoding.TextAppender); ok {
+			buf := buffer.New()
+			defer buf.Free()
+			var err error
+			*buf, err = ta.AppendText(*buf)
+			if err != nil {
+				return err
+			}
+			// TODO: append directly to buffer when possible
+			s.appendString(buf.String())
+			return nil
+		} else if tm, ok := v.any.(encoding.TextMarshaler); ok {
 			data, err := tm.MarshalText()
 			if err != nil {
 				return err

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"internal/asan"
 	"internal/testenv"
 	"net"
 	. "net/netip"
@@ -351,6 +352,32 @@ func TestIPv4Constructors(t *testing.T) {
 	}
 }
 
+func TestAddrAppendText(t *testing.T) {
+	tests := []struct {
+		ip   Addr
+		want string
+	}{
+		{Addr{}, ""}, // zero IP
+		{mustIP("1.2.3.4"), "1.2.3.4"},
+		{mustIP("fd7a:115c:a1e0:ab12:4843:cd96:626b:430b"), "fd7a:115c:a1e0:ab12:4843:cd96:626b:430b"},
+		{mustIP("::ffff:192.168.140.255"), "::ffff:192.168.140.255"},
+		{mustIP("::ffff:192.168.140.255%en0"), "::ffff:192.168.140.255%en0"},
+	}
+	for i, tc := range tests {
+		ip := tc.ip
+
+		mtAppend := make([]byte, 4, 32)
+		mtAppend, err := ip.AppendText(mtAppend)
+		mtAppend = mtAppend[4:]
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(mtAppend) != tc.want {
+			t.Errorf("%d. for (%v) AppendText = %q; want %q", i, ip, mtAppend, tc.want)
+		}
+	}
+}
+
 func TestAddrMarshalUnmarshalBinary(t *testing.T) {
 	tests := []struct {
 		ip       string
@@ -380,6 +407,23 @@ func TestAddrMarshalUnmarshalBinary(t *testing.T) {
 		}
 		if ip != ip2 {
 			t.Fatalf("got %v; want %v", ip2, ip)
+		}
+
+		bAppend := make([]byte, 4, 32)
+		bAppend, err = ip.AppendBinary(bAppend)
+		bAppend = bAppend[4:]
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(bAppend) != tc.wantSize {
+			t.Fatalf("%q encoded to size %d; want %d", tc.ip, len(bAppend), tc.wantSize)
+		}
+		var ip3 Addr
+		if err := ip3.UnmarshalBinary(bAppend); err != nil {
+			t.Fatal(err)
+		}
+		if ip != ip3 {
+			t.Fatalf("got %v; want %v", ip3, ip)
 		}
 	}
 
@@ -416,6 +460,17 @@ func TestAddrPortMarshalTextString(t *testing.T) {
 		if string(mt) != tt.want {
 			t.Errorf("%d. for (%v, %v) MarshalText = %q; want %q", i, tt.in.Addr(), tt.in.Port(), mt, tt.want)
 		}
+
+		mtAppend := make([]byte, 4, 32)
+		mtAppend, err = tt.in.AppendText(mtAppend)
+		mtAppend = mtAppend[4:]
+		if err != nil {
+			t.Errorf("%d. for (%v, %v) AppendText error: %v", i, tt.in.Addr(), tt.in.Port(), err)
+			continue
+		}
+		if string(mtAppend) != tt.want {
+			t.Errorf("%d. for (%v, %v) AppendText = %q; want %q", i, tt.in.Addr(), tt.in.Port(), mtAppend, tt.want)
+		}
 	}
 }
 
@@ -447,6 +502,23 @@ func TestAddrPortMarshalUnmarshalBinary(t *testing.T) {
 		}
 		if ipport != ipport2 {
 			t.Fatalf("got %v; want %v", ipport2, ipport)
+		}
+
+		bAppend := make([]byte, 4, 32)
+		bAppend, err = ipport.AppendBinary(bAppend)
+		bAppend = bAppend[4:]
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(bAppend) != tc.wantSize {
+			t.Fatalf("%q encoded to size %d; want %d", tc.ipport, len(bAppend), tc.wantSize)
+		}
+		var ipport3 AddrPort
+		if err := ipport3.UnmarshalBinary(bAppend); err != nil {
+			t.Fatal(err)
+		}
+		if ipport != ipport3 {
+			t.Fatalf("got %v; want %v", ipport3, ipport)
 		}
 	}
 
@@ -482,6 +554,17 @@ func TestPrefixMarshalTextString(t *testing.T) {
 		if string(mt) != tt.want {
 			t.Errorf("%d. for %v MarshalText = %q; want %q", i, tt.in, mt, tt.want)
 		}
+
+		mtAppend := make([]byte, 4, 64)
+		mtAppend, err = tt.in.AppendText(mtAppend)
+		mtAppend = mtAppend[4:]
+		if err != nil {
+			t.Errorf("%d. for %v AppendText error: %v", i, tt.in, err)
+			continue
+		}
+		if string(mtAppend) != tt.want {
+			t.Errorf("%d. for %v AppendText = %q; want %q", i, tt.in, mtAppend, tt.want)
+		}
 	}
 }
 
@@ -514,6 +597,23 @@ func TestPrefixMarshalUnmarshalBinary(t *testing.T) {
 		}
 		if prefix != prefix2 {
 			t.Fatalf("got %v; want %v", prefix2, prefix)
+		}
+
+		bAppend := make([]byte, 4, 32)
+		bAppend, err = prefix.AppendBinary(bAppend)
+		bAppend = bAppend[4:]
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(bAppend) != tc.wantSize {
+			t.Fatalf("%q encoded to size %d; want %d", tc.prefix, len(bAppend), tc.wantSize)
+		}
+		var prefix3 Prefix
+		if err := prefix3.UnmarshalBinary(bAppend); err != nil {
+			t.Fatal(err)
+		}
+		if prefix != prefix3 {
+			t.Fatalf("got %v; want %v", prefix3, prefix)
 		}
 	}
 
@@ -1023,6 +1123,9 @@ func TestPrefixCompare(t *testing.T) {
 		{mustPrefix("fe80::/48"), mustPrefix("fe80::/64"), -1},
 
 		{mustPrefix("1.2.3.0/24"), mustPrefix("fe80::/8"), -1},
+
+		{mustPrefix("1.2.3.0/24"), mustPrefix("1.2.3.4/24"), -1},
+		{mustPrefix("1.2.3.0/24"), mustPrefix("1.2.3.0/28"), -1},
 	}
 	for _, tt := range tests {
 		got := tt.a.Compare(tt.b)
@@ -1048,10 +1151,70 @@ func TestPrefixCompare(t *testing.T) {
 		Prefix{},
 		mustPrefix("fe80::/48"),
 		mustPrefix("1.2.0.0/24"),
+		mustPrefix("1.2.3.4/24"),
+		mustPrefix("1.2.3.0/28"),
 	}
 	slices.SortFunc(values, Prefix.Compare)
 	got := fmt.Sprintf("%s", values)
-	want := `[invalid Prefix 1.2.0.0/16 1.2.0.0/24 1.2.3.0/24 fe80::/48 fe80::/64 fe90::/64]`
+	want := `[invalid Prefix 1.2.0.0/16 1.2.0.0/24 1.2.3.0/24 1.2.3.4/24 1.2.3.0/28 fe80::/48 fe80::/64 fe90::/64]`
+	if got != want {
+		t.Errorf("unexpected sort\n got: %s\nwant: %s\n", got, want)
+	}
+
+	// Lists from
+	// https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml and
+	// https://www.iana.org/assignments/ipv6-address-space/ipv6-address-space.xhtml,
+	// to verify that the sort order matches IANA's conventional
+	// ordering.
+	values = []Prefix{
+		mustPrefix("0.0.0.0/8"),
+		mustPrefix("127.0.0.0/8"),
+		mustPrefix("10.0.0.0/8"),
+		mustPrefix("203.0.113.0/24"),
+		mustPrefix("169.254.0.0/16"),
+		mustPrefix("192.0.0.0/24"),
+		mustPrefix("240.0.0.0/4"),
+		mustPrefix("192.0.2.0/24"),
+		mustPrefix("192.0.0.170/32"),
+		mustPrefix("198.18.0.0/15"),
+		mustPrefix("192.0.0.8/32"),
+		mustPrefix("0.0.0.0/32"),
+		mustPrefix("192.0.0.9/32"),
+		mustPrefix("198.51.100.0/24"),
+		mustPrefix("192.168.0.0/16"),
+		mustPrefix("192.0.0.10/32"),
+		mustPrefix("192.175.48.0/24"),
+		mustPrefix("192.52.193.0/24"),
+		mustPrefix("100.64.0.0/10"),
+		mustPrefix("255.255.255.255/32"),
+		mustPrefix("192.31.196.0/24"),
+		mustPrefix("172.16.0.0/12"),
+		mustPrefix("192.0.0.0/29"),
+		mustPrefix("192.88.99.0/24"),
+		mustPrefix("fec0::/10"),
+		mustPrefix("6000::/3"),
+		mustPrefix("fe00::/9"),
+		mustPrefix("8000::/3"),
+		mustPrefix("0000::/8"),
+		mustPrefix("0400::/6"),
+		mustPrefix("f800::/6"),
+		mustPrefix("e000::/4"),
+		mustPrefix("ff00::/8"),
+		mustPrefix("a000::/3"),
+		mustPrefix("fc00::/7"),
+		mustPrefix("1000::/4"),
+		mustPrefix("0800::/5"),
+		mustPrefix("4000::/3"),
+		mustPrefix("0100::/8"),
+		mustPrefix("c000::/3"),
+		mustPrefix("fe80::/10"),
+		mustPrefix("0200::/7"),
+		mustPrefix("f000::/5"),
+		mustPrefix("2000::/3"),
+	}
+	slices.SortFunc(values, func(a, b Prefix) int { return a.Compare(b) })
+	got = fmt.Sprintf("%s", values)
+	want = `[0.0.0.0/8 0.0.0.0/32 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.0.0/29 192.0.0.8/32 192.0.0.9/32 192.0.0.10/32 192.0.0.170/32 192.0.2.0/24 192.31.196.0/24 192.52.193.0/24 192.88.99.0/24 192.168.0.0/16 192.175.48.0/24 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 240.0.0.0/4 255.255.255.255/32 ::/8 100::/8 200::/7 400::/6 800::/5 1000::/4 2000::/3 4000::/3 6000::/3 8000::/3 a000::/3 c000::/3 e000::/4 f000::/5 f800::/6 fc00::/7 fe00::/9 fe80::/10 fec0::/10 ff00::/8]`
 	if got != want {
 		t.Errorf("unexpected sort\n got: %s\nwant: %s\n", got, want)
 	}
@@ -1886,6 +2049,14 @@ func BenchmarkPrefixMasking(b *testing.B) {
 	}
 }
 
+func BenchmarkPrefixString(b *testing.B) {
+	b.ReportAllocs()
+	ipp := MustParsePrefix("66.55.44.33/22")
+	for i := 0; i < b.N; i++ {
+		sinkString = ipp.String()
+	}
+}
+
 func BenchmarkPrefixMarshalText(b *testing.B) {
 	b.ReportAllocs()
 	ipp := MustParsePrefix("66.55.44.33/22")
@@ -2033,6 +2204,10 @@ var (
 )
 
 func TestNoAllocs(t *testing.T) {
+	if asan.Enabled {
+		t.Skip("test allocates more with -asan; see #70079")
+	}
+
 	// Wrappers that panic on error, to prove that our alloc-free
 	// methods are returning successfully.
 	panicIP := func(ip Addr, err error) Addr {
@@ -2179,11 +2354,14 @@ func TestPrefixString(t *testing.T) {
 	}
 }
 
-func TestInvalidAddrPortString(t *testing.T) {
+func TestAddrPortString(t *testing.T) {
 	tests := []struct {
 		ipp  AddrPort
 		want string
 	}{
+		{MustParseAddrPort("127.0.0.1:80"), "127.0.0.1:80"},
+		{MustParseAddrPort("[0000::0]:8080"), "[::]:8080"},
+		{MustParseAddrPort("[FFFF::1]:8080"), "[ffff::1]:8080"},
 		{AddrPort{}, "invalid AddrPort"},
 		{AddrPortFrom(Addr{}, 80), "invalid AddrPort"},
 	}

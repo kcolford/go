@@ -489,7 +489,7 @@ func RunFuzzWorker(ctx context.Context, fn func(CorpusEntry) error) error {
 	srv := &workerServer{
 		workerComm: comm,
 		fuzzFn: func(e CorpusEntry) (time.Duration, error) {
-			timer := time.AfterFunc(10*time.Second, func() {
+			timer := time.AfterFunc(60*time.Second, func() {
 				panic("deadlocked!") // this error message won't be printed
 			})
 			defer timer.Stop()
@@ -682,7 +682,7 @@ func (ws *workerServer) serve(ctx context.Context) error {
 }
 
 // chainedMutations is how many mutations are applied before the worker
-// resets the input to it's original state.
+// resets the input to its original state.
 // NOTE: this number was picked without much thought. It is low enough that
 // it seems to create a significant diversity in mutated inputs. We may want
 // to consider looking into this more closely once we have a proper performance

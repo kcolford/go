@@ -12,6 +12,8 @@ import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/imports"
 	"cmd/go/internal/modload"
+
+	"golang.org/x/mod/module"
 )
 
 var cmdWhy = &base.Command{
@@ -47,13 +49,13 @@ For example:
 	(main module does not need package golang.org/x/text/encoding)
 	$
 
-See https://golang.org/ref/mod#go-mod-why for more about 'go mod why'.
+See https://go.dev/ref/mod#go-mod-why for more about 'go mod why'.
 	`,
 }
 
 var (
-	whyM      = cmdWhy.Flag.Bool("m", false, "")
-	whyVendor = cmdWhy.Flag.Bool("vendor", false, "")
+	whyM      = cmdWhy.Flag.Bool("m", false, "treat arguments as a list of modules")
+	whyVendor = cmdWhy.Flag.Bool("vendor", false, "exclude tests of dependencies")
 )
 
 func init() {
@@ -63,9 +65,10 @@ func init() {
 }
 
 func runWhy(ctx context.Context, cmd *base.Command, args []string) {
-	modload.InitWorkfile()
-	modload.ForceUseModules = true
-	modload.RootMode = modload.NeedRoot
+	moduleLoader := modload.NewLoader()
+	moduleLoader.InitWorkfile()
+	moduleLoader.ForceUseModules = true
+	moduleLoader.RootMode = modload.NeedRoot
 	modload.ExplicitWriteGoMod = true // don't write go.mod in ListModules
 
 	loadOpts := modload.PackageOpts{
@@ -81,17 +84,21 @@ func runWhy(ctx context.Context, cmd *base.Command, args []string) {
 			if strings.Contains(arg, "@") {
 				base.Fatalf("go: %s: 'go mod why' requires a module path, not a version query", arg)
 			}
+			if err := checkModulePathPattern(arg); err != nil {
+				base.Errorf("go mod why: %v", err)
+			}
 		}
+		base.ExitIfErrors()
 
-		mods, err := modload.ListModules(ctx, args, 0, "")
+		mods, err := modload.ListModules(moduleLoader, ctx, args, 0, "")
 		if err != nil {
 			base.Fatal(err)
 		}
 
 		byModule := make(map[string][]string)
-		_, pkgs := modload.LoadPackages(ctx, loadOpts, "all")
+		_, pkgs := modload.LoadPackages(moduleLoader, ctx, loadOpts, "all")
 		for _, path := range pkgs {
-			m := modload.PackageModule(path)
+			m := moduleLoader.PackageModule(path)
 			if m.Path != "" {
 				byModule[m.Path] = append(byModule[m.Path], path)
 			}
@@ -101,13 +108,13 @@ func runWhy(ctx context.Context, cmd *base.Command, args []string) {
 			best := ""
 			bestDepth := 1000000000
 			for _, path := range byModule[m.Path] {
-				d := modload.WhyDepth(path)
+				d := moduleLoader.WhyDepth(path)
 				if d > 0 && d < bestDepth {
 					best = path
 					bestDepth = d
 				}
 			}
-			why := modload.Why(best)
+			why := moduleLoader.Why(best)
 			if why == "" {
 				vendoring := ""
 				if *whyVendor {
@@ -120,14 +127,14 @@ func runWhy(ctx context.Context, cmd *base.Command, args []string) {
 		}
 	} else {
 		// Resolve to packages.
-		matches, _ := modload.LoadPackages(ctx, loadOpts, args...)
+		matches, _ := modload.LoadPackages(moduleLoader, ctx, loadOpts, args...)
 
-		modload.LoadPackages(ctx, loadOpts, "all") // rebuild graph, from main module (not from named packages)
+		modload.LoadPackages(moduleLoader, ctx, loadOpts, "all") // rebuild graph, from main module (not from named packages)
 
 		sep := ""
 		for _, m := range matches {
 			for _, path := range m.Pkgs {
-				why := modload.Why(path)
+				why := moduleLoader.Why(path)
 				if why == "" {
 					vendoring := ""
 					if *whyVendor {
@@ -140,4 +147,34 @@ func runWhy(ctx context.Context, cmd *base.Command, args []string) {
 			}
 		}
 	}
+}
+
+func checkModulePathPattern(pattern string) error {
+	parts := strings.Split(pattern, "...")
+	if len(parts) == 1 {
+		return modulePathError(pattern, module.CheckImportPath(pattern))
+	}
+
+	// Add placeholders for the wildcards adjoining each literal part so that
+	// separators at wildcard boundaries form complete paths during validation.
+	if err := module.CheckImportPath(parts[0] + "x"); err != nil {
+		return modulePathError(pattern, err)
+	}
+	for i, part := range parts[1:] {
+		if i < len(parts)-2 {
+			part += "x"
+		}
+		if err := module.CheckFilePath("x" + part); err != nil {
+			return modulePathError(pattern, err)
+		}
+	}
+	return nil
+}
+
+func modulePathError(path string, err error) error {
+	if pathErr, ok := err.(*module.InvalidPathError); ok {
+		pathErr.Kind = "module"
+		pathErr.Path = path
+	}
+	return err
 }

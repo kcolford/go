@@ -13,8 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -83,7 +83,7 @@ func testWinSplitListTestIsValid(t *testing.T, ti int, tt SplitListTest,
 		case err != nil:
 			t.Errorf("%d,%d: execution error %v\n%q", ti, i, err, out)
 			return
-		case !reflect.DeepEqual(out, exp):
+		case !slices.Equal(out, exp):
 			t.Errorf("%d,%d: expected %#q, got %#q", ti, i, exp, out)
 			return
 		default:
@@ -408,12 +408,7 @@ func TestToNorm(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		err := os.Chdir(cwd)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
+	t.Chdir(".") // Ensure cwd is restored after the test.
 
 	tmpVol := filepath.VolumeName(ctmp)
 	if len(tmpVol) != 2 {
@@ -704,6 +699,47 @@ func TestAbsWindows(t *testing.T) {
 		got, err := filepath.Abs(test.path)
 		if err != nil || got != test.want {
 			t.Errorf("Abs(%q) = %q, %v; want %q, nil", test.path, got, err, test.want)
+		}
+	}
+}
+
+func TestRelUNC(t *testing.T) {
+	tests := []struct {
+		base    string
+		targ    string
+		want    string
+		wantErr bool
+	}{
+		{`\\host\share`, `\\host\share`, `.`, false},
+		{`\\host\share`, `\\host\share\`, `.`, false},
+		{`\\host\share`, filepath.Clean(`\\host\share\`), `.`, false},
+		{`\\host\share`, `\\host\share\file.txt`, `file.txt`, false},
+		{`\\host\share\`, `\\host\share\file.txt`, `file.txt`, false},
+		{`\\HOST\SHARE`, `\\host\share\file.txt`, `file.txt`, false},
+		{`\\host\share\dir`, `\\host\share\dir\file.txt`, `file.txt`, false},
+		{`\\host\share\dir`, `\\host\share\file.txt`, `..\file.txt`, false},
+		{`\\host\share\dir\file.txt`, `\\host\share\dir`, `..`, false},
+		{`\\host\share\`, `\\host\share`, `.`, false},
+		{`\\host\share\dir`, `\\host\share`, `..`, false},
+		{`\\host\share`, `\\host\other\file.txt`, ``, true},
+		{`\\host\share`, filepath.Clean(`\\host\other\`), ``, true},
+		{`\\host\share`, filepath.Clean(`\\other\share\`), ``, true},
+	}
+
+	for _, test := range tests {
+		got, err := filepath.Rel(test.base, test.targ)
+		if test.wantErr {
+			if err == nil {
+				t.Errorf("Rel(%q, %q) = %q, want error", test.base, test.targ, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("Rel(%q, %q): want %q, got error: %s", test.base, test.targ, test.want, err)
+			continue
+		}
+		if got != test.want {
+			t.Errorf("Rel(%q, %q) = %q, want %q", test.base, test.targ, got, test.want)
 		}
 	}
 }

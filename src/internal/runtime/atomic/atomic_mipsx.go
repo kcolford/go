@@ -4,16 +4,6 @@
 
 //go:build mips || mipsle
 
-// Export some functions via linkname to assembly in sync/atomic.
-//
-//go:linkname Xadd64
-//go:linkname Xchg64
-//go:linkname Cas64
-//go:linkname Load64
-//go:linkname Store64
-//go:linkname Or64
-//go:linkname And64
-
 package atomic
 
 import (
@@ -134,6 +124,9 @@ func Xadduintptr(ptr *uintptr, delta uintptr) uintptr
 
 //go:noescape
 func Xchg(ptr *uint32, new uint32) uint32
+
+//go:noescape
+func Xchg8(ptr *uint8, new uint8) uint8
 
 //go:noescape
 func Xchguintptr(ptr *uintptr, new uintptr) uintptr

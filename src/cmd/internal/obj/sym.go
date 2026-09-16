@@ -33,7 +33,7 @@ package obj
 
 import (
 	"cmd/internal/goobj"
-	"cmd/internal/notsha256"
+	"cmd/internal/hash"
 	"cmd/internal/objabi"
 	"encoding/base64"
 	"encoding/binary"
@@ -42,12 +42,11 @@ import (
 	"log"
 	"math"
 	"sort"
+	"sync"
 )
 
 func Linknew(arch *LinkArch) *Link {
 	ctxt := new(Link)
-	ctxt.hash = make(map[string]*LSym)
-	ctxt.funchash = make(map[string]*LSym)
 	ctxt.statichash = make(map[string]*LSym)
 	ctxt.Arch = arch
 	ctxt.Pathname = objabi.WorkingDir()
@@ -90,28 +89,34 @@ func (ctxt *Link) LookupABI(name string, abi ABI) *LSym {
 // If it does not exist, it creates it and
 // passes it to init for one-time initialization.
 func (ctxt *Link) LookupABIInit(name string, abi ABI, init func(s *LSym)) *LSym {
-	var hash map[string]*LSym
+	var hash *sync.Map
 	switch abi {
 	case ABI0:
-		hash = ctxt.hash
+		hash = &ctxt.hash
 	case ABIInternal:
-		hash = ctxt.funchash
+		hash = &ctxt.funchash
 	default:
 		panic("unknown ABI")
 	}
 
-	ctxt.hashmu.Lock()
-	s := hash[name]
-	if s == nil {
-		s = &LSym{Name: name}
-		s.SetABI(abi)
-		hash[name] = s
-		if init != nil {
-			init(s)
+	c, _ := hash.Load(name)
+	if c == nil {
+		once := &symOnce{
+			sym: LSym{Name: name},
 		}
+		once.sym.SetABI(abi)
+		c, _ = hash.LoadOrStore(name, once)
 	}
-	ctxt.hashmu.Unlock()
-	return s
+	once := c.(*symOnce)
+	if init != nil && !once.inited.Load() {
+		ctxt.hashmu.Lock()
+		if !once.inited.Load() {
+			init(&once.sym)
+			once.inited.Store(true)
+		}
+		ctxt.hashmu.Unlock()
+	}
+	return &once.sym
 }
 
 // Lookup looks up the symbol with name name.
@@ -124,26 +129,46 @@ func (ctxt *Link) Lookup(name string) *LSym {
 // If it does not exist, it creates it and
 // passes it to init for one-time initialization.
 func (ctxt *Link) LookupInit(name string, init func(s *LSym)) *LSym {
-	ctxt.hashmu.Lock()
-	s := ctxt.hash[name]
-	if s == nil {
-		s = &LSym{Name: name}
-		ctxt.hash[name] = s
-		if init != nil {
-			init(s)
+	c, _ := ctxt.hash.Load(name)
+	if c == nil {
+		once := &symOnce{
+			sym: LSym{Name: name},
 		}
+		c, _ = ctxt.hash.LoadOrStore(name, once)
 	}
-	ctxt.hashmu.Unlock()
-	return s
+	once := c.(*symOnce)
+	if init != nil && !once.inited.Load() {
+		// TODO(dmo): some of our init functions modify other fields
+		// in the symbol table. They are only implicitly protected since
+		// we serialize all inits under the hashmu lock.
+		// Consider auditing the functions and have them lock their
+		// concurrent access values explicitly. This would make it possible
+		// to have more than one than one init going at a time (although this might
+		// be a theoretical concern, I have yet to catch this lock actually being waited
+		// on).
+		ctxt.hashmu.Lock()
+		if !once.inited.Load() {
+			init(&once.sym)
+			once.inited.Store(true)
+		}
+		ctxt.hashmu.Unlock()
+	}
+	return &once.sym
+}
+
+func (ctxt *Link) rodataKind() (suffix string, typ objabi.SymKind) {
+	return "", objabi.SRODATA
 }
 
 func (ctxt *Link) Float32Sym(f float32) *LSym {
+	suffix, typ := ctxt.rodataKind()
 	i := math.Float32bits(f)
-	name := fmt.Sprintf("$f32.%08x", i)
+	name := fmt.Sprintf("$f32.%08x%s", i, suffix)
 	return ctxt.LookupInit(name, func(s *LSym) {
 		s.Size = 4
+		s.Align = 4
 		s.WriteFloat32(ctxt, 0, f)
-		s.Type = objabi.SRODATA
+		s.Type = typ
 		s.Set(AttrLocal, true)
 		s.Set(AttrContentAddressable, true)
 		ctxt.constSyms = append(ctxt.constSyms, s)
@@ -151,12 +176,14 @@ func (ctxt *Link) Float32Sym(f float32) *LSym {
 }
 
 func (ctxt *Link) Float64Sym(f float64) *LSym {
+	suffix, typ := ctxt.rodataKind()
 	i := math.Float64bits(f)
-	name := fmt.Sprintf("$f64.%016x", i)
+	name := fmt.Sprintf("$f64.%016x%s", i, suffix)
 	return ctxt.LookupInit(name, func(s *LSym) {
 		s.Size = 8
+		s.Align = int16(ctxt.Arch.PtrSize)
 		s.WriteFloat64(ctxt, 0, f)
-		s.Type = objabi.SRODATA
+		s.Type = typ
 		s.Set(AttrLocal, true)
 		s.Set(AttrContentAddressable, true)
 		ctxt.constSyms = append(ctxt.constSyms, s)
@@ -164,11 +191,13 @@ func (ctxt *Link) Float64Sym(f float64) *LSym {
 }
 
 func (ctxt *Link) Int32Sym(i int64) *LSym {
-	name := fmt.Sprintf("$i32.%08x", uint64(i))
+	suffix, typ := ctxt.rodataKind()
+	name := fmt.Sprintf("$i32.%08x%s", uint64(i), suffix)
 	return ctxt.LookupInit(name, func(s *LSym) {
 		s.Size = 4
+		s.Align = 4
 		s.WriteInt(ctxt, 0, 4, i)
-		s.Type = objabi.SRODATA
+		s.Type = typ
 		s.Set(AttrLocal, true)
 		s.Set(AttrContentAddressable, true)
 		ctxt.constSyms = append(ctxt.constSyms, s)
@@ -176,11 +205,13 @@ func (ctxt *Link) Int32Sym(i int64) *LSym {
 }
 
 func (ctxt *Link) Int64Sym(i int64) *LSym {
-	name := fmt.Sprintf("$i64.%016x", uint64(i))
+	suffix, typ := ctxt.rodataKind()
+	name := fmt.Sprintf("$i64.%016x%s", uint64(i), suffix)
 	return ctxt.LookupInit(name, func(s *LSym) {
 		s.Size = 8
+		s.Align = int16(ctxt.Arch.PtrSize)
 		s.WriteInt(ctxt, 0, 8, i)
-		s.Type = objabi.SRODATA
+		s.Type = typ
 		s.Set(AttrLocal, true)
 		s.Set(AttrContentAddressable, true)
 		ctxt.constSyms = append(ctxt.constSyms, s)
@@ -188,9 +219,11 @@ func (ctxt *Link) Int64Sym(i int64) *LSym {
 }
 
 func (ctxt *Link) Int128Sym(hi, lo int64) *LSym {
-	name := fmt.Sprintf("$i128.%016x%016x", uint64(hi), uint64(lo))
+	suffix, typ := ctxt.rodataKind()
+	name := fmt.Sprintf("$i128.%016x%016x%s", uint64(hi), uint64(lo), suffix)
 	return ctxt.LookupInit(name, func(s *LSym) {
 		s.Size = 16
+		s.Align = int16(ctxt.Arch.PtrSize)
 		if ctxt.Arch.ByteOrder == binary.LittleEndian {
 			s.WriteInt(ctxt, 0, 8, lo)
 			s.WriteInt(ctxt, 8, 8, hi)
@@ -198,7 +231,7 @@ func (ctxt *Link) Int128Sym(hi, lo int64) *LSym {
 			s.WriteInt(ctxt, 0, 8, hi)
 			s.WriteInt(ctxt, 8, 8, lo)
 		}
-		s.Type = objabi.SRODATA
+		s.Type = typ
 		s.Set(AttrLocal, true)
 		s.Set(AttrContentAddressable, true)
 		ctxt.constSyms = append(ctxt.constSyms, s)
@@ -207,11 +240,12 @@ func (ctxt *Link) Int128Sym(hi, lo int64) *LSym {
 
 // GCLocalsSym generates a content-addressable sym containing data.
 func (ctxt *Link) GCLocalsSym(data []byte) *LSym {
-	sum := notsha256.Sum256(data)
+	sum := hash.Sum32(data)
 	str := base64.StdEncoding.EncodeToString(sum[:16])
 	return ctxt.LookupInit(fmt.Sprintf("gclocals·%s", str), func(lsym *LSym) {
 		lsym.P = data
 		lsym.Set(AttrContentAddressable, true)
+		lsym.Align = 4
 	})
 }
 
@@ -311,7 +345,7 @@ func (ctxt *Link) NumberSyms() {
 			// Assign special index for builtin symbols.
 			// Don't do it when linking against shared libraries, as the runtime
 			// may be in a different library.
-			if i := goobj.BuiltinIdx(rs.Name, int(rs.ABI())); i != -1 {
+			if i := goobj.BuiltinIdx(rs.Name, int(rs.ABI())); i != -1 && !rs.IsLinkname() {
 				rs.PkgIdx = goobj.PkgIdxBuiltin
 				rs.SymIdx = int32(i)
 				rs.Set(AttrIndexed, true)
@@ -369,10 +403,10 @@ func isNonPkgSym(ctxt *Link, s *LSym) bool {
 	return false
 }
 
-// StaticNamePref is the prefix the front end applies to static temporary
+// StaticNamePrefix is the prefix the front end applies to static temporary
 // variables. When turned into LSyms, these can be tagged as static so
 // as to avoid inserting them into the linker's name lookup tables.
-const StaticNamePref = ".stmp_"
+const StaticNamePrefix = ".stmp_"
 
 type traverseFlag uint32
 
@@ -406,7 +440,7 @@ func (ctxt *Link) traverseSyms(flag traverseFlag, fn func(*LSym)) {
 			}
 			if flag&traverseAux != 0 {
 				fnNoNil(s.Gotype)
-				if s.Type == objabi.STEXT {
+				if s.Type.IsText() {
 					f := func(parent *LSym, aux *LSym) {
 						fn(aux)
 					}
@@ -415,7 +449,7 @@ func (ctxt *Link) traverseSyms(flag traverseFlag, fn func(*LSym)) {
 					fnNoNil(v.dwarfInfoSym)
 				}
 			}
-			if flag&traversePcdata != 0 && s.Type == objabi.STEXT {
+			if flag&traversePcdata != 0 && s.Type.IsText() {
 				fi := s.Func().Pcln
 				fnNoNil(fi.Pcsp)
 				fnNoNil(fi.Pcfile)
@@ -458,7 +492,13 @@ func (ctxt *Link) traverseFuncAux(flag traverseFlag, fsym *LSym, fn func(parent 
 		}
 	}
 
-	auxsyms := []*LSym{fninfo.dwarfRangesSym, fninfo.dwarfLocSym, fninfo.dwarfDebugLinesSym, fninfo.dwarfInfoSym, fninfo.WasmImportSym, fninfo.sehUnwindInfoSym}
+	auxsyms := []*LSym{fninfo.dwarfRangesSym, fninfo.dwarfLocSym, fninfo.dwarfDebugLinesSym, fninfo.dwarfInfoSym, fninfo.sehUnwindInfoSym}
+	if wi := fninfo.WasmImport; wi != nil {
+		auxsyms = append(auxsyms, wi.AuxSym)
+	}
+	if we := fninfo.WasmExport; we != nil {
+		auxsyms = append(auxsyms, we.AuxSym)
+	}
 	for _, s := range auxsyms {
 		if s == nil || s.Size == 0 {
 			continue
@@ -485,7 +525,7 @@ func (ctxt *Link) traverseAuxSyms(flag traverseFlag, fn func(parent *LSym, aux *
 					fn(s, s.Gotype)
 				}
 			}
-			if s.Type == objabi.STEXT {
+			if s.Type.IsText() {
 				ctxt.traverseFuncAux(flag, s, fn, files)
 			} else if v := s.VarInfo(); v != nil && v.dwarfInfoSym != nil {
 				fn(s, v.dwarfInfoSym)

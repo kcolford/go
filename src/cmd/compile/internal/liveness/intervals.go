@@ -49,6 +49,7 @@ package liveness
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -66,25 +67,9 @@ func (i Interval) String() string {
 	return fmt.Sprintf("[%d,%d)", i.st, i.en)
 }
 
-// TEMPORARY until bootstrap version catches up.
-func imin(i, j int) int {
-	if i < j {
-		return i
-	}
-	return j
-}
-
-// TEMPORARY until bootstrap version catches up.
-func imax(i, j int) int {
-	if i > j {
-		return i
-	}
-	return j
-}
-
 // Overlaps returns true if here is any overlap between i and i2.
 func (i Interval) Overlaps(i2 Interval) bool {
-	return (imin(i.en, i2.en) - imax(i.st, i2.st)) > 0
+	return (min(i.en, i2.en) - max(i.st, i2.st)) > 0
 }
 
 // adjacent returns true if the start of one interval is equal to the
@@ -99,8 +84,8 @@ func (i1 *Interval) MergeInto(i2 Interval) error {
 	if !i1.Overlaps(i2) && !i1.adjacent(i2) {
 		return fmt.Errorf("merge method invoked on non-overlapping/non-adjacent")
 	}
-	i1.st = imin(i1.st, i2.st)
-	i1.en = imax(i1.en, i2.en)
+	i1.st = min(i1.st, i2.st)
+	i1.en = max(i1.en, i2.en)
 	return nil
 }
 
@@ -131,11 +116,7 @@ func (c *IntervalsBuilder) setLast(x int) {
 
 func (c *IntervalsBuilder) Finish() (Intervals, error) {
 	// Reverse intervals list and check.
-	// FIXME: replace with slices.Reverse once the
-	// bootstrap version supports it.
-	for i, j := 0, len(c.s)-1; i < j; i, j = i+1, j-1 {
-		c.s[i], c.s[j] = c.s[j], c.s[i]
-	}
+	slices.Reverse(c.s)
 	if err := check(c.s); err != nil {
 		return Intervals{}, err
 	}
@@ -168,7 +149,7 @@ func (c *IntervalsBuilder) Live(pos int) error {
 }
 
 // Kill method should be invoked on instruction at position p if instr
-// should be treated as as having a kill (lifetime end) for the
+// should be treated as having a kill (lifetime end) for the
 // resource. See the example in the comment at the beginning of this
 // file for an example. Note that if we see a kill at position K for a
 // resource currently live since J, this will result in a lifetime

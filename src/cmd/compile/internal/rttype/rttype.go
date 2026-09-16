@@ -49,25 +49,25 @@ func Init() {
 	// Note: this has to be called explicitly instead of being
 	// an init function so it runs after the types package has
 	// been properly initialized.
-	Type = fromReflect(reflect.TypeOf(abi.Type{}))
-	ArrayType = fromReflect(reflect.TypeOf(abi.ArrayType{}))
-	ChanType = fromReflect(reflect.TypeOf(abi.ChanType{}))
-	FuncType = fromReflect(reflect.TypeOf(abi.FuncType{}))
-	InterfaceType = fromReflect(reflect.TypeOf(abi.InterfaceType{}))
-	MapType = fromReflect(reflect.TypeOf(abi.MapType{}))
-	PtrType = fromReflect(reflect.TypeOf(abi.PtrType{}))
-	SliceType = fromReflect(reflect.TypeOf(abi.SliceType{}))
-	StructType = fromReflect(reflect.TypeOf(abi.StructType{}))
+	Type = FromReflect(reflect.TypeFor[abi.Type]())
+	ArrayType = FromReflect(reflect.TypeFor[abi.ArrayType]())
+	ChanType = FromReflect(reflect.TypeFor[abi.ChanType]())
+	FuncType = FromReflect(reflect.TypeFor[abi.FuncType]())
+	InterfaceType = FromReflect(reflect.TypeFor[abi.InterfaceType]())
+	MapType = FromReflect(reflect.TypeFor[abi.MapType]())
+	PtrType = FromReflect(reflect.TypeFor[abi.PtrType]())
+	SliceType = FromReflect(reflect.TypeFor[abi.SliceType]())
+	StructType = FromReflect(reflect.TypeFor[abi.StructType]())
 
-	IMethod = fromReflect(reflect.TypeOf(abi.Imethod{}))
-	Method = fromReflect(reflect.TypeOf(abi.Method{}))
-	StructField = fromReflect(reflect.TypeOf(abi.StructField{}))
-	UncommonType = fromReflect(reflect.TypeOf(abi.UncommonType{}))
+	IMethod = FromReflect(reflect.TypeFor[abi.Imethod]())
+	Method = FromReflect(reflect.TypeFor[abi.Method]())
+	StructField = FromReflect(reflect.TypeFor[abi.StructField]())
+	UncommonType = FromReflect(reflect.TypeFor[abi.UncommonType]())
 
-	InterfaceSwitch = fromReflect(reflect.TypeOf(abi.InterfaceSwitch{}))
-	TypeAssert = fromReflect(reflect.TypeOf(abi.TypeAssert{}))
+	InterfaceSwitch = FromReflect(reflect.TypeFor[abi.InterfaceSwitch]())
+	TypeAssert = FromReflect(reflect.TypeFor[abi.TypeAssert]())
 
-	ITab = fromReflect(reflect.TypeOf(abi.ITab{}))
+	ITab = FromReflect(reflect.TypeFor[abi.ITab]())
 
 	// Make sure abi functions are correct. These functions are used
 	// by the linker which doesn't have the ability to do type layout,
@@ -88,10 +88,28 @@ func Init() {
 	if got, want := int64(abi.ITabTypeOff(ptrSize)), ITab.OffsetOf("Type"); got != want {
 		base.Fatalf("abi.ITabTypeOff() == %d, want %d", got, want)
 	}
+	for _, test := range []struct {
+		kind abi.Kind
+		typ  *types.Type
+		name string
+	}{
+		{abi.Struct, StructType, "Struct"},
+		{abi.Pointer, PtrType, "Pointer"},
+		{abi.Func, FuncType, "Func"},
+		{abi.Slice, SliceType, "Slice"},
+		{abi.Array, ArrayType, "Array"},
+		{abi.Chan, ChanType, "Chan"},
+		{abi.Map, MapType, "Map"},
+		{abi.Interface, InterfaceType, "Interface"},
+	} {
+		if got, want := int64(abi.RTypeSize(test.kind, ptrSize)), test.typ.Size(); got != want {
+			base.Fatalf("abi.RTypeSize(%s) == %d, want %d", test.name, got, want)
+		}
+	}
 }
 
-// fromReflect translates from a host type to the equivalent target type.
-func fromReflect(rt reflect.Type) *types.Type {
+// FromReflect translates from a host type to the equivalent target type.
+func FromReflect(rt reflect.Type) *types.Type {
 	t := reflectToType(rt)
 	types.CalcSize(t)
 	return t
@@ -106,6 +124,10 @@ func reflectToType(rt reflect.Type) *types.Type {
 		return types.Types[types.TBOOL]
 	case reflect.Int:
 		return types.Types[types.TINT]
+	case reflect.Int8:
+		return types.Types[types.TINT8]
+	case reflect.Int16:
+		return types.Types[types.TINT16]
 	case reflect.Int32:
 		return types.Types[types.TINT32]
 	case reflect.Uint8:
@@ -114,9 +136,15 @@ func reflectToType(rt reflect.Type) *types.Type {
 		return types.Types[types.TUINT16]
 	case reflect.Uint32:
 		return types.Types[types.TUINT32]
+	case reflect.Float32:
+		return types.Types[types.TFLOAT32]
+	case reflect.Float64:
+		return types.Types[types.TFLOAT64]
 	case reflect.Uintptr:
 		return types.Types[types.TUINTPTR]
-	case reflect.Ptr, reflect.Func, reflect.UnsafePointer:
+	case reflect.Ptr:
+		return types.NewPtr(reflectToType(rt.Elem()))
+	case reflect.Func, reflect.UnsafePointer:
 		// TODO: there's no mechanism to distinguish different pointer types,
 		// so we treat them all as unsafe.Pointer.
 		return types.Types[types.TUNSAFEPTR]
@@ -132,6 +160,12 @@ func reflectToType(rt reflect.Type) *types.Type {
 			fields[i] = &types.Field{Sym: &types.Sym{Name: f.Name}, Type: ft}
 		}
 		return types.NewStruct(fields)
+	case reflect.Chan:
+		return types.NewChan(reflectToType(rt.Elem()), types.ChanDir(rt.ChanDir()))
+	case reflect.String:
+		return types.Types[types.TSTRING]
+	case reflect.Complex128:
+		return types.Types[types.TCOMPLEX128]
 	default:
 		base.Fatalf("unhandled kind %s", rt.Kind())
 		return nil
@@ -153,7 +187,7 @@ func NewCursor(lsym *obj.LSym, off int64, t *types.Type) Cursor {
 
 // WritePtr writes a pointer "target" to the component at the location specified by c.
 func (c Cursor) WritePtr(target *obj.LSym) {
-	if c.typ.Kind() != types.TUNSAFEPTR {
+	if c.typ.Kind() != types.TUNSAFEPTR && c.typ.Kind() != types.TPTR {
 		base.Fatalf("can't write ptr, it has kind %s", c.typ.Kind())
 	}
 	if target == nil {
@@ -243,11 +277,10 @@ func (c Cursor) WriteSlice(target *obj.LSym, off, len, cap int64) {
 
 // Reloc adds a relocation from the current cursor position.
 // Reloc fills in Off and Siz fields. Caller should fill in the rest (Type, others).
-func (c Cursor) Reloc() *obj.Reloc {
-	r := obj.Addrel(c.lsym)
-	r.Off = int32(c.offset)
-	r.Siz = uint8(c.typ.Size())
-	return r
+func (c Cursor) Reloc(rel obj.Reloc) {
+	rel.Off = int32(c.offset)
+	rel.Siz = uint8(c.typ.Size())
+	c.lsym.AddRel(base.Ctxt, rel)
 }
 
 // Field selects the field with the given name from the struct pointed to by c.

@@ -4,6 +4,10 @@
 
 // Package ast declares the types used to represent syntax trees for Go
 // packages.
+//
+// Syntax trees may be constructed directly, but they are typically
+// produced from Go source code by the parser; see the
+// [go/parser.ParseFile] function.
 package ast
 
 import (
@@ -130,10 +134,10 @@ func (g *CommentGroup) Text() string {
 		}
 
 		// Split on newlines.
-		cl := strings.Split(c, "\n")
+		cl := strings.SplitSeq(c, "\n")
 
 		// Walk lines, stripping trailing white space and adding to list.
-		for _, l := range cl {
+		for l := range cl {
 			lines = append(lines, stripTrailingWhitespace(l))
 		}
 	}
@@ -299,8 +303,19 @@ type (
 	}
 
 	// A BasicLit node represents a literal of basic type.
+	//
+	// Note that for the CHAR and STRING kinds, the literal is stored
+	// with its quotes. For example, for a double-quoted STRING, the
+	// first and the last rune in the Value field will be ". The
+	// [strconv.Unquote] and [strconv.UnquoteChar] functions can be
+	// used to unquote STRING and CHAR values, respectively.
+	//
+	// For raw string literals (Kind == token.STRING && Value[0] == '`'),
+	// the Value field contains the string text without carriage returns (\r) that
+	// may have been present in the source.
 	BasicLit struct {
 		ValuePos token.Pos   // literal position
+		ValueEnd token.Pos   // position immediately after the literal
 		Kind     token.Token // token.INT, token.FLOAT, token.IMAG, token.CHAR, or token.STRING
 		Value    string      // literal string; e.g. 42, 0x7f, 3.14, 1e-9, 2.4i, 'a', '\x7f', "foo" or `\m\n\o`
 	}
@@ -519,7 +534,15 @@ func (x *Ellipsis) End() token.Pos {
 	}
 	return x.Ellipsis + 3 // len("...")
 }
-func (x *BasicLit) End() token.Pos       { return token.Pos(int(x.ValuePos) + len(x.Value)) }
+func (x *BasicLit) End() token.Pos {
+	if !x.ValueEnd.IsValid() {
+		// Not from parser; use a heuristic.
+		// (Incorrect for `...` containing \r\n;
+		// see https://go.dev/issue/76031.)
+		return token.Pos(int(x.ValuePos) + len(x.Value))
+	}
+	return x.ValueEnd
+}
 func (x *FuncLit) End() token.Pos        { return x.Body.End() }
 func (x *CompositeLit) End() token.Pos   { return x.Rbrace + 1 }
 func (x *ParenExpr) End() token.Pos      { return x.Rparen + 1 }
@@ -1048,16 +1071,20 @@ type File struct {
 	Scope              *Scope          // package scope (this file only). Deprecated: see Object
 	Imports            []*ImportSpec   // imports in this file
 	Unresolved         []*Ident        // unresolved identifiers in this file. Deprecated: see Object
-	Comments           []*CommentGroup // list of all comments in the source file
+	Comments           []*CommentGroup // comments in the file, in lexical order
 	GoVersion          string          // minimum Go version required by //go:build or // +build directives
 }
 
 // Pos returns the position of the package declaration.
-// (Use FileStart for the start of the entire file.)
+// It may be invalid, for example in an empty file.
+//
+// (Use FileStart for the start of the entire file. It is always valid.)
 func (f *File) Pos() token.Pos { return f.Package }
 
 // End returns the end of the last declaration in the file.
-// (Use FileEnd for the end of the entire file.)
+// It may be invalid, for example in an empty file.
+//
+// (Use FileEnd for the end of the entire file. It is always valid.)
 func (f *File) End() token.Pos {
 	if n := len(f.Decls); n > 0 {
 		return f.Decls[n-1].End()
@@ -1083,10 +1110,10 @@ func (p *Package) End() token.Pos { return token.NoPos }
 // not handwritten, by detecting the special comment described
 // at https://go.dev/s/generatedcode.
 //
-// The syntax tree must have been parsed with the [parser.ParseComments] flag.
+// The syntax tree must have been parsed with the [go/parser.ParseComments] flag.
 // Example:
 //
-//	f, err := parser.ParseFile(fset, filename, src, parser.ParseComments|parser.PackageClauseOnly)
+//	f, err := parser.ParseFile(fset, filename, src, parser.ParseComments|parser.PackageClauseOnly|parser.SkipObjectResolution)
 //	if err != nil { ... }
 //	gen := ast.IsGenerated(f)
 func IsGenerated(file *File) bool {
@@ -1103,7 +1130,7 @@ func generator(file *File) (string, bool) {
 			// opt: check Contains first to avoid unnecessary array allocation in Split.
 			const prefix = "// Code generated "
 			if strings.Contains(comment.Text, prefix) {
-				for _, line := range strings.Split(comment.Text, "\n") {
+				for line := range strings.SplitSeq(comment.Text, "\n") {
 					if rest, ok := strings.CutPrefix(line, prefix); ok {
 						if gen, ok := strings.CutSuffix(rest, " DO NOT EDIT."); ok {
 							return gen, true

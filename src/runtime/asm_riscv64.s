@@ -5,6 +5,43 @@
 #include "go_asm.h"
 #include "funcdata.h"
 #include "textflag.h"
+#include "cgo/abi_riscv64.h"
+
+
+// When building with -buildmode=c-shared, this symbol is called when the shared
+// library is loaded.
+TEXT _rt0_riscv64_lib(SB),NOSPLIT,$224
+	// Preserve callee-save registers, along with X1 (LR).
+	MOV	X1, (8*3)(X2)
+	SAVE_GPR((8*4))
+	SAVE_FPR((8*16))
+
+	// Initialize g as nil in case of using g later e.g. sigaction in cgo_sigaction.go
+	MOV	X0, g
+
+	MOV	A0, _rt0_riscv64_lib_argc<>(SB)
+	MOV	A1, _rt0_riscv64_lib_argv<>(SB)
+
+	MOV	$runtime·libInit(SB), T1
+	JALR	RA, T1
+
+	// Restore callee-save registers, along with X1 (LR).
+	MOV	(8*3)(X2), X1
+	RESTORE_GPR((8*4))
+	RESTORE_FPR((8*16))
+
+	RET
+
+TEXT runtime·rt0_lib_go<ABIInternal>(SB),NOSPLIT,$0
+	MOV	_rt0_riscv64_lib_argc<>(SB), A0
+	MOV	_rt0_riscv64_lib_argv<>(SB), A1
+	MOV	$runtime·rt0_go(SB), T0
+	JALR	ZERO, T0
+
+DATA _rt0_riscv64_lib_argc<>(SB)/8, $0
+GLOBL _rt0_riscv64_lib_argc<>(SB),NOPTR, $8
+DATA _rt0_riscv64_lib_argv<>(SB)/8, $0
+GLOBL _rt0_riscv64_lib_argv<>(SB),NOPTR, $8
 
 // func rt0_go()
 TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
@@ -24,14 +61,14 @@ TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 	MOV	X2, (g_stack+stack_hi)(g)
 
 	// if there is a _cgo_init, call it using the gcc ABI.
-	MOV	_cgo_init(SB), T0
-	BEQ	T0, ZERO, nocgo
+	MOV	_cgo_init(SB), T2
+	BEQ	T2, ZERO, nocgo
 
 	MOV	ZERO, A3		// arg 3: not used
 	MOV	ZERO, A2		// arg 2: not used
 	MOV	$setg_gcc<>(SB), A1	// arg 1: setg
 	MOV	g, A0			// arg 0: G
-	JALR	RA, T0
+	JALR	RA, T2
 
 nocgo:
 	// update stackguard after _cgo_init
@@ -64,6 +101,7 @@ nocgo:
 	ADD	$16, X2
 
 	// start this M
+	CALL	runtime·stackcheck(SB)	// fault if stack check is wrong
 	CALL	runtime·mstart(SB)
 
 	WORD $0 // crash if reached
@@ -80,12 +118,11 @@ TEXT setg_gcc<>(SB),NOSPLIT,$0-0
 	RET
 
 // func cputicks() int64
-TEXT runtime·cputicks(SB),NOSPLIT,$0-8
+TEXT runtime·cputicks<ABIInternal>(SB),NOSPLIT,$0-0
 	// RDTIME to emulate cpu ticks
 	// RDCYCLE reads counter that is per HART(core) based
 	// according to the riscv manual, see issue 46737
-	RDTIME	A0
-	MOV	A0, ret+0(FP)
+	RDTIME	X10
 	RET
 
 // systemstack_switch is a dummy routine that systemstack leaves at the bottom
@@ -238,19 +275,15 @@ TEXT runtime·morestack_noctxt(SB),NOSPLIT|NOFRAME,$0-0
 	MOV	ZERO, CTXT
 	JMP	runtime·morestack(SB)
 
-// AES hashing not implemented for riscv64
-TEXT runtime·memhash<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-32
-	JMP	runtime·memhashFallback<ABIInternal>(SB)
-TEXT runtime·strhash<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-24
-	JMP	runtime·strhashFallback<ABIInternal>(SB)
-TEXT runtime·memhash32<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-24
-	JMP	runtime·memhash32Fallback<ABIInternal>(SB)
-TEXT runtime·memhash64<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-24
-	JMP	runtime·memhash64Fallback<ABIInternal>(SB)
+// check that SP is in range [g->stack.lo, g->stack.hi]
+TEXT runtime·stackcheck(SB), NOSPLIT|NOFRAME, $0-0
+	MOV	(g_stack+stack_hi)(g), A0
+	BGEU	A0, X2, 2(PC)
+	CALL	runtime·abort(SB)
 
-// func return0()
-TEXT runtime·return0(SB), NOSPLIT, $0
-	MOV	$0, A0
+	MOV	(g_stack+stack_lo)(g), A0
+	BGTU	X2, A0, 2(PC)
+	CALL	runtime·abort(SB)
 	RET
 
 // restore state from Gobuf; longjmp
@@ -268,17 +301,15 @@ TEXT gogo<>(SB), NOSPLIT|NOFRAME, $0
 
 	MOV	gobuf_sp(T0), X2
 	MOV	gobuf_lr(T0), RA
-	MOV	gobuf_ret(T0), A0
 	MOV	gobuf_ctxt(T0), CTXT
 	MOV	ZERO, gobuf_sp(T0)
-	MOV	ZERO, gobuf_ret(T0)
 	MOV	ZERO, gobuf_lr(T0)
 	MOV	ZERO, gobuf_ctxt(T0)
 	MOV	gobuf_pc(T0), T0
 	JALR	ZERO, T0
 
-// func procyield(cycles uint32)
-TEXT runtime·procyield(SB),NOSPLIT,$0-0
+// func procyieldAsm(cycles uint32)
+TEXT runtime·procyieldAsm(SB),NOSPLIT,$0-0
 	RET
 
 // Switch to m->g0's stack, call fn(g).
@@ -321,7 +352,6 @@ TEXT gosave_systemstack_switch<>(SB),NOSPLIT|NOFRAME,$0
 	MOV	X31, (g_sched+gobuf_pc)(g)
 	MOV	X2, (g_sched+gobuf_sp)(g)
 	MOV	ZERO, (g_sched+gobuf_lr)(g)
-	MOV	ZERO, (g_sched+gobuf_ret)(g)
 	// Assert ctxt is zero. See func save.
 	MOV	(g_sched+gobuf_ctxt)(g), X31
 	BEQ	ZERO, X31, 2(PC)
@@ -332,9 +362,13 @@ TEXT gosave_systemstack_switch<>(SB),NOSPLIT|NOFRAME,$0
 // Call fn(arg) aligned appropriately for the gcc ABI.
 // Called on a system stack, and there may be no g yet (during needm).
 TEXT ·asmcgocall_no_g(SB),NOSPLIT,$0-16
-	MOV	fn+0(FP), X5
+	MOV	fn+0(FP), X11
 	MOV	arg+8(FP), X10
-	JALR	RA, (X5)
+	MOV	X2, X9		// save SP in X9 (callee-saved in C ABI)
+	ANDI	$~15, X2	// align SP to 16 bytes per C ABI
+	MOV	X0, X8		// clear frame pointer register (see asmcgocall)
+	JALR	RA, (X11)
+	MOV	X9, X2
 	RET
 
 // func asmcgocall(fn, arg unsafe.Pointer) int32
@@ -342,7 +376,7 @@ TEXT ·asmcgocall_no_g(SB),NOSPLIT,$0-16
 // aligned appropriately for the gcc ABI.
 // See cgocall.go for more details.
 TEXT ·asmcgocall(SB),NOSPLIT,$0-20
-	MOV	fn+0(FP), X5
+	MOV	fn+0(FP), X11
 	MOV	arg+8(FP), X10
 
 	MOV	X2, X8	// save original stack pointer
@@ -352,6 +386,7 @@ TEXT ·asmcgocall(SB),NOSPLIT,$0-20
 	// We get called to create new OS threads too, and those
 	// come in on the m->g0 stack already. Or we might already
 	// be on the m->gsignal stack.
+	BEQZ	g, nosave
 	MOV	g_m(g), X6
 	MOV	m_gsignal(X6), X7
 	BEQ	X7, g, g0
@@ -365,6 +400,7 @@ TEXT ·asmcgocall(SB),NOSPLIT,$0-20
 
 	// Now on a scheduling stack (a pthread-created stack).
 g0:
+	ANDI	$~15, X2	// align SP to 16 bytes per C ABI
 	// Save room for two of our pointers.
 	SUB	$16, X2
 	MOV	X9, 0(X2)	// save old g on stack
@@ -372,7 +408,15 @@ g0:
 	SUB	X8, X9, X8
 	MOV	X8, 8(X2)	// save depth in old g stack (can't just save SP, as stack might be copied during a callback)
 
-	JALR	RA, (X5)
+	// Clear the frame pointer register before calling into C.
+	// At least some C unwinder does frame pointer unwinding.
+	// As Go currently doesn't use frame pointer on RISCV64,
+	// the C unwinder may see garbage value and may crash.
+	// Zero the frame pointer to tell the unwinder to stop
+	// (it is a stack switch anyway).
+	// If we enable frame pointers in Go, revisit this.
+	MOV	X0, X8
+	JALR	RA, (X11)
 
 	// Restore g, stack pointer. X10 is return value.
 	MOV	0(X2), g
@@ -382,6 +426,22 @@ g0:
 	SUB	X6, X5, X6
 	MOV	X6, X2
 
+	MOVW	X10, ret+16(FP)
+	RET
+
+nosave:
+	// Running on a system stack, perhaps even without a g.
+	// Having no g can happen during thread creation or thread teardown.
+	MOV	fn+0(FP), X11
+	MOV	arg+8(FP), X10
+	MOV	X2, X8
+	ANDI	$~15, X2	// align SP to 16 bytes per C ABI
+	SUB	$16, X2
+	MOV	ZERO, 0(X2)	// Where above code stores g, in case someone looks during debugging.
+	MOV	X8, 8(X2)	// Save original stack pointer.
+	MOV	X0, X8		// Clear frame pointer (see above)
+	JALR	RA, (X11)
+	MOV	8(X2), X2	// Restore stack pointer.
 	MOVW	X10, ret+16(FP)
 	RET
 
@@ -534,13 +594,22 @@ TEXT _cgo_topofstack(SB),NOSPLIT,$8
 	RET
 
 // func goexit(neverCallThisFunction)
-// The top-most function running on a goroutine
-// returns to goexit+PCQuantum.
+// The top-most function running on a goroutine, returns to goexit+PCQuantum*2.
+// Note that the NOPs are written in a manner that will not be compressed,
+// since the offset must be known by the runtime.
 TEXT runtime·goexit(SB),NOSPLIT|NOFRAME|TOPFRAME,$0-0
-	MOV	ZERO, ZERO	// NOP
+	WORD	$0x00000013	// NOP
 	JMP	runtime·goexit1(SB)	// does not return
 	// traceback from goexit1 must hit code range of goexit
-	MOV	ZERO, ZERO	// NOP
+	WORD	$0x00000013	// NOP
+
+// This is called from .init_array and follows the platform, not the Go ABI.
+TEXT runtime·addmoduledata(SB),NOSPLIT,$0-0
+	// Use X31 as it is a scratch register in both the Go ABI and psABI.
+	MOV	runtime·lastmoduledatap(SB), X31
+	MOV	X10, moduledata_next(X31)
+	MOV	X10, runtime·lastmoduledatap(SB)
+	RET
 
 // func cgocallback(fn, frame unsafe.Pointer, ctxt uintptr)
 // See cgocall.go for more details.
@@ -685,11 +754,6 @@ TEXT runtime·setg(SB), NOSPLIT, $0-8
 	MOV	gg+0(FP), g
 	// This only happens if iscgo, so jump straight to save_g
 	CALL	runtime·save_g(SB)
-	RET
-
-TEXT ·checkASM(SB),NOSPLIT,$0-1
-	MOV	$1, T0
-	MOV	T0, ret+0(FP)
 	RET
 
 // spillArgs stores return values from registers to a *internal/abi.RegArgs in X25.
@@ -884,80 +948,32 @@ TEXT runtime·gcWriteBarrier8<ABIInternal>(SB),NOSPLIT,$0
 	MOV	$64, X24
 	JMP	gcWriteBarrier<>(SB)
 
-// Note: these functions use a special calling convention to save generated code space.
-// Arguments are passed in registers (ssa/gen/RISCV64Ops.go), but the space for those
-// arguments are allocated in the caller's stack frame.
-// These stubs write the args into that stack space and then tail call to the
-// corresponding runtime handler.
-// The tail call makes these stubs disappear in backtraces.
-TEXT runtime·panicIndex<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T0, X10
-	MOV	T1, X11
-	JMP	runtime·goPanicIndex<ABIInternal>(SB)
-TEXT runtime·panicIndexU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T0, X10
-	MOV	T1, X11
-	JMP	runtime·goPanicIndexU<ABIInternal>(SB)
-TEXT runtime·panicSliceAlen<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T1, X10
-	MOV	T2, X11
-	JMP	runtime·goPanicSliceAlen<ABIInternal>(SB)
-TEXT runtime·panicSliceAlenU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T1, X10
-	MOV	T2, X11
-	JMP	runtime·goPanicSliceAlenU<ABIInternal>(SB)
-TEXT runtime·panicSliceAcap<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T1, X10
-	MOV	T2, X11
-	JMP	runtime·goPanicSliceAcap<ABIInternal>(SB)
-TEXT runtime·panicSliceAcapU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T1, X10
-	MOV	T2, X11
-	JMP	runtime·goPanicSliceAcapU<ABIInternal>(SB)
-TEXT runtime·panicSliceB<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T0, X10
-	MOV	T1, X11
-	JMP	runtime·goPanicSliceB<ABIInternal>(SB)
-TEXT runtime·panicSliceBU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T0, X10
-	MOV	T1, X11
-	JMP	runtime·goPanicSliceBU<ABIInternal>(SB)
-TEXT runtime·panicSlice3Alen<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T2, X10
-	MOV	T3, X11
-	JMP	runtime·goPanicSlice3Alen<ABIInternal>(SB)
-TEXT runtime·panicSlice3AlenU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T2, X10
-	MOV	T3, X11
-	JMP	runtime·goPanicSlice3AlenU<ABIInternal>(SB)
-TEXT runtime·panicSlice3Acap<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T2, X10
-	MOV	T3, X11
-	JMP	runtime·goPanicSlice3Acap<ABIInternal>(SB)
-TEXT runtime·panicSlice3AcapU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T2, X10
-	MOV	T3, X11
-	JMP	runtime·goPanicSlice3AcapU<ABIInternal>(SB)
-TEXT runtime·panicSlice3B<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T1, X10
-	MOV	T2, X11
-	JMP	runtime·goPanicSlice3B<ABIInternal>(SB)
-TEXT runtime·panicSlice3BU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T1, X10
-	MOV	T2, X11
-	JMP	runtime·goPanicSlice3BU<ABIInternal>(SB)
-TEXT runtime·panicSlice3C<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T0, X10
-	MOV	T1, X11
-	JMP	runtime·goPanicSlice3C<ABIInternal>(SB)
-TEXT runtime·panicSlice3CU<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T0, X10
-	MOV	T1, X11
-	JMP	runtime·goPanicSlice3CU<ABIInternal>(SB)
-TEXT runtime·panicSliceConvert<ABIInternal>(SB),NOSPLIT,$0-16
-	MOV	T2, X10
-	MOV	T3, X11
-	JMP	runtime·goPanicSliceConvert<ABIInternal>(SB)
+TEXT runtime·panicBounds<ABIInternal>(SB),NOSPLIT,$144-0
+	NO_LOCAL_POINTERS
+	// Save all 16 int registers that could have an index in them.
+	// They may be pointers, but if they are they are dead.
+	// Skip X0 aka ZERO, X1 aka LR, X2 aka SP, X3 aka GP, X4 aka TP.
+	MOV	X5, 24(X2)
+	MOV	X6, 32(X2)
+	MOV	X7, 40(X2)
+	MOV	X8, 48(X2)
+	MOV	X9, 56(X2)
+	MOV	X10, 64(X2)
+	MOV	X11, 72(X2)
+	MOV	X12, 80(X2)
+	MOV	X13, 88(X2)
+	MOV	X14, 96(X2)
+	MOV	X15, 104(X2)
+	MOV	X16, 112(X2)
+	MOV	X17, 120(X2)
+	MOV	X18, 128(X2)
+	MOV	X19, 136(X2)
+	MOV	X20, 144(X2)
+
+	MOV	X1, X10		// PC immediately after call to panicBounds
+	ADD	$24, X2, X11	// pointer to save area
+	CALL	runtime·panicBounds64<ABIInternal>(SB)
+	RET
 
 DATA	runtime·mainPC+0(SB)/8,$runtime·main<ABIInternal>(SB)
 GLOBL	runtime·mainPC(SB),RODATA,$8

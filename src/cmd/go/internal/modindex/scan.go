@@ -8,6 +8,7 @@ import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/fsys"
 	"cmd/go/internal/str"
+	"cmd/internal/par"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,23 +18,24 @@ import (
 	"go/token"
 	"io/fs"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
 // moduleWalkErr returns filepath.SkipDir if the directory isn't relevant
 // when indexing a module or generating a filehash, ErrNotIndexed,
 // if the module shouldn't be indexed, and nil otherwise.
-func moduleWalkErr(root string, path string, info fs.FileInfo, err error) error {
+func moduleWalkErr(root string, path string, d fs.DirEntry, err error) error {
 	if err != nil {
 		return ErrNotIndexed
 	}
 	// stop at module boundaries
-	if info.IsDir() && path != root {
-		if fi, err := fsys.Stat(filepath.Join(path, "go.mod")); err == nil && !fi.IsDir() {
+	if d.IsDir() && path != root {
+		if info, err := fsys.Stat(filepath.Join(path, "go.mod")); err == nil && !info.IsDir() {
 			return filepath.SkipDir
 		}
 	}
-	if info.Mode()&fs.ModeSymlink != 0 {
+	if d.Type()&fs.ModeSymlink != 0 {
 		if target, err := fsys.Stat(path); err == nil && target.IsDir() {
 			// return an error to make the module hash invalid.
 			// Symlink directories in modules are tricky, so we won't index
@@ -51,30 +53,40 @@ func moduleWalkErr(root string, path string, info fs.FileInfo, err error) error 
 // be indexed because it contains symlinks.
 func indexModule(modroot string) ([]byte, error) {
 	fsys.Trace("indexModule", modroot)
-	var packages []*rawPackage
+	var dirs []string
 
 	// If the root itself is a symlink to a directory,
 	// we want to follow it (see https://go.dev/issue/50807).
 	// Add a trailing separator to force that to happen.
 	root := str.WithFilePathSeparator(modroot)
-	err := fsys.Walk(root, func(path string, info fs.FileInfo, err error) error {
-		if err := moduleWalkErr(root, path, info, err); err != nil {
+	err := fsys.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err := moduleWalkErr(root, path, d, err); err != nil {
 			return err
 		}
 
-		if !info.IsDir() {
+		if !d.IsDir() {
 			return nil
 		}
 		if !strings.HasPrefix(path, root) {
 			panic(fmt.Errorf("path %v in walk doesn't have modroot %v as prefix", path, modroot))
 		}
 		rel := path[len(root):]
-		packages = append(packages, importRaw(modroot, rel))
+		dirs = append(dirs, rel)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	packages := make([]*rawPackage, len(dirs))
+	work := par.NewQueue(runtime.GOMAXPROCS(0))
+	for i, rel := range dirs {
+		work.Add(func() {
+			packages[i] = importRaw(modroot, rel)
+		})
+	}
+	<-work.Idle()
+
 	return encodeModuleBytes(packages), nil
 }
 
@@ -112,10 +124,10 @@ func parseErrorToString(err error) string {
 		return ""
 	}
 	var p parseError
-	if e, ok := err.(scanner.ErrorList); ok {
-		p.ErrorList = &e
+	if errlist, ok := err.(scanner.ErrorList); ok {
+		p.ErrorList = &errlist
 	} else {
-		p.ErrorString = e.Error()
+		p.ErrorString = err.Error()
 	}
 	s, err := json.Marshal(p)
 	if err != nil {
@@ -204,7 +216,7 @@ func importRaw(modroot, reldir string) *rawPackage {
 		if d.IsDir() {
 			continue
 		}
-		if d.Mode()&fs.ModeSymlink != 0 {
+		if d.Type()&fs.ModeSymlink != 0 {
 			if isDir(filepath.Join(absdir, d.Name())) {
 				// Symlinks to directories are not source files.
 				continue
@@ -275,7 +287,7 @@ func importRaw(modroot, reldir string) *rawPackage {
 // which is the comment on import "C".
 func extractCgoDirectives(doc string) []string {
 	var out []string
-	for _, line := range strings.Split(doc, "\n") {
+	for line := range strings.SplitSeq(doc, "\n") {
 		// Line is
 		//	#cgo [GOOS/GOARCH...] LDFLAGS: stuff
 		//

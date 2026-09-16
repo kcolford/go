@@ -87,10 +87,7 @@ func MakeTask() {
 
 	// Record user init functions.
 	for _, fn := range typecheck.Target.Inits {
-		if fn.Sym().Name == "init" {
-			// Synthetic init function for initialization of package-scope
-			// variables. We can use staticinit to optimize away static
-			// assignments.
+		if staticinit.CanOptimize(fn) {
 			s := staticinit.Schedule{
 				Plans: make(map[ir.Node]*staticinit.Plan),
 				Temps: make(map[ir.Node]*ir.Name),
@@ -138,9 +135,7 @@ func MakeTask() {
 	// that this package depends on (and thus, all of the packages
 	// that need to be initialized before this one).
 	for _, d := range deps {
-		r := obj.Addrel(lsym)
-		r.Type = objabi.R_INITORDER
-		r.Sym = d
+		lsym.AddRel(base.Ctxt, obj.Reloc{Type: objabi.R_INITORDER, Sym: d})
 	}
 	// An initTask has pointers, but none into the Go heap.
 	// It's not quite read only, the state field must be modifiable.

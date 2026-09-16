@@ -86,13 +86,13 @@ func CheckExpr(fset *token.FileSet, pkg *Package, pos token.Pos, expr ast.Expr, 
 	// initialize checker
 	check := NewChecker(nil, fset, pkg, info)
 	check.scope = scope
-	check.pos = pos
+	check.exprPos = pos
 	defer check.handleBailout(&err)
 
 	// evaluate node
 	var x operand
-	check.rawExpr(nil, &x, expr, nil, true) // allow generic expressions
-	check.processDelayed(0)                 // incl. all functions
+	check.rawExpr(nil, &x, expr, true) // allow generic expressions
+	check.processDelayed(0)            // incl. all functions
 	check.recordUntyped()
 
 	return nil

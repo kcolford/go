@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http/httptrace"
@@ -278,6 +280,10 @@ type Request struct {
 	// the request body is read. Once the body returns EOF, the caller must
 	// not mutate Trailer.
 	//
+	// Writing a request whose Trailer contains a key with invalid bytes
+	// (such as CR or LF), or such a value present when Write begins,
+	// returns an error.
+	//
 	// Few HTTP clients, servers, or proxies support HTTP trailers.
 	Trailer Header
 
@@ -390,12 +396,8 @@ func (r *Request) Clone(ctx context.Context) *Request {
 	*r2 = *r
 	r2.ctx = ctx
 	r2.URL = cloneURL(r.URL)
-	if r.Header != nil {
-		r2.Header = r.Header.Clone()
-	}
-	if r.Trailer != nil {
-		r2.Trailer = r.Trailer.Clone()
-	}
+	r2.Header = r.Header.Clone()
+	r2.Trailer = r.Trailer.Clone()
 	if s := r.TransferEncoding; s != nil {
 		s2 := make([]string, len(s))
 		copy(s2, s)
@@ -411,13 +413,7 @@ func (r *Request) Clone(ctx context.Context) *Request {
 		copy(s2, s)
 		r2.matches = s2
 	}
-	if s := r.otherValues; s != nil {
-		s2 := make(map[string]string, len(s))
-		for k, v := range s {
-			s2[k] = v
-		}
-		r2.otherValues = s2
-	}
+	r2.otherValues = maps.Clone(r.otherValues)
 	return r2
 }
 
@@ -567,6 +563,11 @@ const defaultUserAgent = "Go-http-client/1.1"
 // If Body is present, Content-Length is <= 0 and [Request.TransferEncoding]
 // hasn't been set to "identity", Write adds "Transfer-Encoding:
 // chunked" to the header. Body is closed after it is sent.
+//
+// Header values for Host, Content-Length, Transfer-Encoding,
+// and Trailer are not used; these are derived from other Request fields.
+// If the Header does not contain a User-Agent value, Write uses
+// "Go-http-client/1.1".
 func (r *Request) Write(w io.Writer) error {
 	return r.write(w, false, nil, nil)
 }
@@ -788,15 +789,11 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 type requestBodyReadError struct{ error }
 
 func idnaASCII(v string) (string, error) {
-	// TODO: Consider removing this check after verifying performance is okay.
-	// Right now punycode verification, length checks, context checks, and the
-	// permissible character tests are all omitted. It also prevents the ToASCII
-	// call from salvaging an invalid IDN, when possible. As a result it may be
-	// possible to have two IDNs that appear identical to the user where the
-	// ASCII-only version causes an error downstream whereas the non-ASCII
-	// version does not.
-	// Note that for correct ASCII IDNs ToASCII will only do considerably more
-	// work, but it will not cause an allocation.
+	// TODO: Follow the WHATWG URL Specification.
+	//
+	// WHATWG accepts all ASCII-only names (although sometimes with advisory
+	// validation errors), so skipping the relatively expensive IDNA processing
+	// on them is fine.
 	if ascii.Is(v) {
 		return v, nil
 	}
@@ -864,7 +861,7 @@ func validMethod(method string) bool {
 	   extension-method = token
 	     token          = 1*<any CHAR except CTLs or separators>
 	*/
-	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
+	return isToken(method)
 }
 
 // NewRequest wraps [NewRequestWithContext] using [context.Background].
@@ -882,12 +879,12 @@ func NewRequest(method, url string, body io.Reader) (*Request, error) {
 //
 // NewRequestWithContext returns a Request suitable for use with
 // [Client.Do] or [Transport.RoundTrip]. To create a request for use with
-// testing a Server Handler, either use the [NewRequest] function in the
-// net/http/httptest package, use [ReadRequest], or manually update the
-// Request fields. For an outgoing client request, the context
+// testing a Server Handler, either use the [net/http/httptest.NewRequest] function,
+// use [ReadRequest], or manually update the Request fields.
+// For an outgoing client request, the context
 // controls the entire lifetime of a request and its response:
 // obtaining a connection, sending the request, and reading the
-// response headers and body. See the Request type's documentation for
+// response headers and body. See the [Request] type's documentation for
 // the difference between inbound and outbound request fields.
 //
 // If body is of type [*bytes.Buffer], [*bytes.Reader], or
@@ -917,7 +914,7 @@ func NewRequestWithContext(ctx context.Context, method, url string, body io.Read
 		rc = io.NopCloser(body)
 	}
 	// The host's colon:port should be normalized. See Issue 14836.
-	u.Host = removeEmptyPort(u.Host)
+	u.Host = strings.TrimSuffix(u.Host, ":")
 	req := &Request{
 		ctx:        ctx,
 		Method:     method,
@@ -1071,8 +1068,13 @@ func ReadRequest(b *bufio.Reader) (*Request, error) {
 	}
 
 	delete(req.Header, "Host")
-	return req, err
+	return req, nil
 }
+
+// readMIMEHeader is defined in package [net/textproto].
+//
+//go:linkname readMIMEHeader net/textproto.readMIMEHeader
+func readMIMEHeader(r *textproto.Reader, maxMemory, maxHeaders int64) (textproto.MIMEHeader, error)
 
 // readRequest should be an internal detail,
 // but widely used packages access it using linkname.
@@ -1086,6 +1088,10 @@ func ReadRequest(b *bufio.Reader) (*Request, error) {
 //
 //go:linkname readRequest
 func readRequest(b *bufio.Reader) (req *Request, err error) {
+	return readRequestLimit(b, math.MaxInt64)
+}
+
+func readRequestLimit(b *bufio.Reader, maxHeaders int64) (req *Request, err error) {
 	tp := newTextprotoReader(b)
 	defer putTextprotoReader(tp)
 
@@ -1139,8 +1145,12 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 	}
 
 	// Subsequent lines: Key: value.
-	mimeHeader, err := tp.ReadMIMEHeader()
+	mimeHeader, err := readMIMEHeader(tp, math.MaxInt64, maxHeaders)
 	if err != nil {
+		// TODO: Add a distinguishable error to net/textproto.
+		if err.Error() == "message too large" {
+			return nil, errTooLarge
+		}
 		return nil, err
 	}
 	req.Header = Header(mimeHeader)
@@ -1164,7 +1174,7 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 
 	req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
 
-	err = readTransfer(req, b)
+	err = readTransfer(req, b, maxHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -1475,6 +1485,9 @@ func (r *Request) FormFile(key string) (multipart.File, *multipart.FileHeader, e
 // that matched the request.
 // It returns the empty string if the request was not matched against a pattern
 // or there is no such wildcard in the pattern.
+//
+// The value is unescaped. For example, if the pattern "/b/{bucket}" matches
+// the path "/b/a%2fb", PathValue("bucket") returns "a/b".
 func (r *Request) PathValue(name string) string {
 	if i := r.patIndex(name); i >= 0 {
 		return r.matches[i]
@@ -1484,6 +1497,7 @@ func (r *Request) PathValue(name string) string {
 
 // SetPathValue sets name to value, so that subsequent calls to r.PathValue(name)
 // return value.
+// It does not unescape value.
 func (r *Request) SetPathValue(name, value string) {
 	if i := r.patIndex(name); i >= 0 {
 		r.matches[i] = value

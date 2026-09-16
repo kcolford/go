@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -58,8 +59,6 @@ func TestStdlib(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for dir := range dirFiles {
-		dir := dir
-
 		cpulimit <- struct{}{}
 		wg.Add(1)
 		go func() {
@@ -317,6 +316,7 @@ func TestStdFixed(t *testing.T) {
 		"issue16369.go",  // types2 handles this correctly - not an issue
 		"issue18459.go",  // types2 doesn't check validity of //go:xxx directives
 		"issue18882.go",  // types2 doesn't check validity of //go:xxx directives
+		"issue20027.go",  // types2 does not have constraints on channel element size
 		"issue20529.go",  // types2 does not have constraints on stack size
 		"issue22200.go",  // types2 does not have constraints on stack size
 		"issue22200b.go", // types2 does not have constraints on stack size
@@ -328,6 +328,7 @@ func TestStdFixed(t *testing.T) {
 		"issue48230.go",  // go/types doesn't check validity of //go:xxx directives
 		"issue49767.go",  // go/types does not have constraints on channel element size
 		"issue49814.go",  // go/types does not have constraints on array size
+		"issue78355.go",  // types2 does not have constraints on map element size
 		"issue56103.go",  // anonymous interface cycles; will be a type checker error in 1.22
 		"issue52697.go",  // types2 does not have constraints on stack size
 
@@ -352,11 +353,28 @@ func TestStdKen(t *testing.T) {
 
 // Package paths of excluded packages.
 var excluded = map[string]bool{
-	"builtin": true,
+	"builtin":                       true,
+	"cmd/compile/internal/ssa/_gen": true,
+	"crypto/internal/cryptotest/wycheproof/_schema": true,
+	"crypto/internal/cryptotest/x509limbo/_schema":  true,
+	"runtime/_mkmalloc":                             true,
+}
 
-	// go.dev/issue/46027: some imports are missing for this submodule.
-	"crypto/internal/edwards25519/field/_asm": true,
-	"crypto/internal/bigmod/_asm":             true,
+func isExcluded(pkgPath string) bool {
+	if excluded[pkgPath] {
+		return true
+	}
+
+	// Submodules where not all dependencies are available.
+	// See go.dev/issue/46027.
+	if strings.HasPrefix(pkgPath, "simd/archsimd/_gen") {
+		return true
+	}
+	if slices.Contains(strings.Split(pkgPath, "/"), "_asm") {
+		return true
+	}
+
+	return false
 }
 
 // printPackageMu synchronizes the printing of type-checked package files in
@@ -396,8 +414,7 @@ func typecheckFiles(path string, filenames []string, importer Importer) (*Packag
 		Error: func(err error) {
 			errs = append(errs, err)
 		},
-		Importer:    importer,
-		EnableAlias: true,
+		Importer: importer,
 	}
 	info := Info{Uses: make(map[*syntax.Name]Object)}
 	pkg, _ := conf.Check(path, files, &info)
@@ -436,7 +453,7 @@ func pkgFilenames(dir string, includeTest bool) ([]string, error) {
 		}
 		return nil, err
 	}
-	if excluded[pkg.ImportPath] {
+	if isExcluded(pkg.ImportPath) {
 		return nil, nil
 	}
 	var filenames []string
@@ -451,7 +468,7 @@ func pkgFilenames(dir string, includeTest bool) ([]string, error) {
 	return filenames, nil
 }
 
-func walkPkgDirs(dir string, pkgh func(dir string, filenames []string), errh func(args ...interface{})) {
+func walkPkgDirs(dir string, pkgh func(dir string, filenames []string), errh func(args ...any)) {
 	w := walker{pkgh, errh}
 	w.walk(dir)
 }

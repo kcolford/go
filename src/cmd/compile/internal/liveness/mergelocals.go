@@ -9,10 +9,12 @@ import (
 	"cmd/compile/internal/bitvec"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/ssa"
+	"cmd/compile/internal/ssa/ssaop"
 	"cmd/internal/src"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -55,7 +57,7 @@ type candRegion struct {
 type cstate struct {
 	fn             *ir.Func
 	f              *ssa.Func
-	lv             *liveness
+	lv             *Liveness
 	cands          []*ir.Name
 	nameToSlot     map[*ir.Name]int32
 	regions        []candRegion
@@ -160,8 +162,8 @@ func (mls *MergeLocalsState) Followers(n *ir.Name, tmp []*ir.Name) []*ir.Name {
 	for _, k := range sl[1:] {
 		tmp = append(tmp, mls.vars[k])
 	}
-	sort.SliceStable(tmp, func(i, j int) bool {
-		return tmp[i].Sym().Name < tmp[j].Sym().Name
+	slices.SortStableFunc(tmp, func(a, b *ir.Name) int {
+		return strings.Compare(a.Sym().Name, b.Sym().Name)
 	})
 	return tmp
 }
@@ -268,8 +270,8 @@ func (mls *MergeLocalsState) String() string {
 			leaders = append(leaders, n)
 		}
 	}
-	sort.Slice(leaders, func(i, j int) bool {
-		return leaders[i].Sym().Name < leaders[j].Sym().Name
+	slices.SortFunc(leaders, func(a, b *ir.Name) int {
+		return strings.Compare(a.Sym().Name, b.Sym().Name)
 	})
 	var sb strings.Builder
 	for _, n := range leaders {
@@ -489,13 +491,13 @@ func (cs *cstate) populateIndirectUseTable(cands []*ir.Name) ([]*ir.Name, []cand
 		rawcands[n] = struct{}{}
 	}
 	for k := 0; k < len(cs.f.Blocks); k++ {
-		genmapclear(pendingUses)
-		genmapclear(blockIndirectUE)
+		clear(pendingUses)
+		clear(blockIndirectUE)
 		b := cs.f.Blocks[k]
 		for _, v := range b.Values {
 			if n, e := affectedVar(v); n != nil {
 				if _, ok := rawcands[n]; ok {
-					if e&ssa.SymAddr != 0 && v.Uses != 0 {
+					if e&ssaop.SymAddr != 0 && v.Uses != 0 {
 						// we're taking the address of candidate var n
 						if _, ok := pendingUses[v.ID]; ok {
 							// should never happen
@@ -512,8 +514,26 @@ func (cs *cstate) populateIndirectUseTable(cands []*ir.Name) ([]*ir.Name, []cand
 					}
 				}
 			}
-			for _, arg := range v.Args {
+			for idx, arg := range v.Args {
 				if nc, ok := pendingUses[arg.ID]; ok {
+					if !v.AddrSinkArg(idx) {
+						// If this op may propagate its input address
+						// to somewhere else, we must track where that
+						// somewhere else might be. See issue 80127.
+						if v.Type.IsMemory() {
+							// Might be stored to memory. Give up.
+							continue
+						}
+						// Some sort of address arithmetic.
+						if _, ok := pendingUses[v.ID]; ok {
+							// v has used multiple addresses, which is something
+							// we can't keep track of. Give up.
+							continue
+						}
+						// Treat this op as producing the address of the same variable
+						// that its argument was the address of.
+						pendingUses[v.ID] = nameCount{n: nc.n, count: v.Uses}
+					}
 					// We found a use of some value that took the
 					// address of nc.n. Record this inst as a
 					// potential indirect use.
@@ -546,7 +566,7 @@ func (cs *cstate) populateIndirectUseTable(cands []*ir.Name) ([]*ir.Name, []cand
 		// that value is flowing out of the block off somewhere else,
 		// we're going to treat that local as truly address-taken and
 		// not have it be a merge candidate.
-		genmapclear(evicted)
+		clear(evicted)
 		if len(pendingUses) != 0 {
 			for id, nc := range pendingUses {
 				if cs.trace > 2 {
@@ -580,7 +600,7 @@ func (cs *cstate) populateIndirectUseTable(cands []*ir.Name) ([]*ir.Name, []cand
 		for k := range indirectUE {
 			ids = append(ids, k)
 		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		slices.Sort(ids)
 		for _, id := range ids {
 			fmt.Fprintf(os.Stderr, "  v%d:", id)
 			for _, n := range indirectUE[id] {
@@ -603,14 +623,6 @@ func (cs *cstate) populateIndirectUseTable(cands []*ir.Name) ([]*ir.Name, []cand
 		return nil, nil
 	}
 	return pruned, regions
-}
-
-// FIXME: bootstrap tool compiler is build with a "go 1.20" go.mod, so
-// we are not allowed to use map clear yet. Use this helper instead.
-func genmapclear[KT comparable, VT any](m map[KT]VT) {
-	for k := range m {
-		delete(m, k)
-	}
 }
 
 type nameCount struct {
@@ -682,7 +694,7 @@ func nextRegion(cands []*ir.Name, idx int) int {
 // given subrange of cands described by st and en (indices into our
 // candidate var list), where the variables within this range have
 // already been determined to be compatible with respect to type,
-// size, etc. Overlapping is done in a a greedy fashion: we select the
+// size, etc. Overlapping is done in a greedy fashion: we select the
 // first element in the st->en range, then walk the rest of the
 // elements adding in vars whose lifetimes don't overlap with the
 // first element, then repeat the process until we run out of work.
@@ -952,7 +964,7 @@ func (cs *cstate) computeIntervals() {
 		//
 		// Note the SPanchored: this ensures that the scheduler won't
 		// move the MOVDaddr earlier than the vardef. With a variable
-		// "xyz" that has no pointers, howver, if we start with
+		// "xyz" that has no pointers, however, if we start with
 		//
 		//    v66 = VarDef <mem> {t2} v65
 		//    v67 = LocalAddr <*T> {t2} v2 v66
@@ -1011,7 +1023,7 @@ func fmtFullPos(p src.XPos) string {
 	var sb strings.Builder
 	sep := ""
 	base.Ctxt.AllPos(p, func(pos src.Pos) {
-		fmt.Fprintf(&sb, sep)
+		sb.WriteString(sep)
 		sep = "|"
 		file := filepath.Base(pos.Filename())
 		fmt.Fprintf(&sb, "%s:%d:%d", file, pos.Line(), pos.Col())

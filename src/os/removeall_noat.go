@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !unix
+//go:build (js && wasm) || plan9
 
 package os
 
@@ -17,6 +17,12 @@ func removeAll(path string) error {
 		// fail silently to retain compatibility with previous behavior
 		// of RemoveAll. See issue 28830.
 		return nil
+	}
+
+	// Consistency with Root.RemoveAll: Strip trailing /s from the path,
+	// so RemoveAll("not_a_directory/") succeeds.
+	for len(path) > 1 && IsPathSeparator(path[len(path)-1]) {
+		path = path[:len(path)-1]
 	}
 
 	// The rmdir system call permits removing "." on Plan 9,

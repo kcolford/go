@@ -67,7 +67,7 @@
 // in your browser.
 //
 // For a study of the facility in action, visit
-// https://blog.golang.org/2011/06/profiling-go-programs.html.
+// https://go.dev/blog/pprof.
 package pprof
 
 import (
@@ -86,7 +86,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -351,24 +351,27 @@ func collectProfile(p *pprof.Profile) (*profile.Profile, error) {
 }
 
 var profileSupportsDelta = map[handler]bool{
-	"allocs":       true,
-	"block":        true,
-	"goroutine":    true,
-	"heap":         true,
-	"mutex":        true,
-	"threadcreate": true,
+	"allocs":        true,
+	"block":         true,
+	"goroutineleak": true,
+	"goroutine":     true,
+	"heap":          true,
+	"mutex":         true,
+	"threadcreate":  true,
 }
 
 var profileDescriptions = map[string]string{
-	"allocs":       "A sampling of all past memory allocations",
-	"block":        "Stack traces that led to blocking on synchronization primitives",
-	"cmdline":      "The command line invocation of the current program",
-	"goroutine":    "Stack traces of all current goroutines. Use debug=2 as a query parameter to export in the same format as an unrecovered panic.",
-	"heap":         "A sampling of memory allocations of live objects. You can specify the gc GET parameter to run GC before taking the heap sample.",
-	"mutex":        "Stack traces of holders of contended mutexes",
-	"profile":      "CPU profile. You can specify the duration in the seconds GET parameter. After you get the profile file, use the go tool pprof command to investigate the profile.",
-	"threadcreate": "Stack traces that led to the creation of new OS threads",
-	"trace":        "A trace of execution of the current program. You can specify the duration in the seconds GET parameter. After you get the trace file, use the go tool trace command to investigate the trace.",
+	"allocs":        "A sampling of all past memory allocations",
+	"block":         "Stack traces that led to blocking on synchronization primitives",
+	"cmdline":       "The command line invocation of the current program",
+	"goroutine":     "Stack traces of all current goroutines. Use debug=2 as a query parameter to export in the same format as an unrecovered panic.",
+	"heap":          "A sampling of memory allocations of live objects. You can specify the gc GET parameter to run GC before taking the heap sample.",
+	"mutex":         "Stack traces of holders of contended mutexes",
+	"profile":       "CPU profile. You can specify the duration in the seconds GET parameter. After you get the profile file, use the go tool pprof command to investigate the profile.",
+	"symbol":        "Maps given program counters to function names. Counters can be specified in a GET raw query or POST body, multiple counters are separated by '+'.",
+	"threadcreate":  "Stack traces that led to the creation of new OS threads",
+	"trace":         "A trace of execution of the current program. You can specify the duration in the seconds GET parameter. After you get the trace file, use the go tool trace command to investigate the trace.",
+	"goroutineleak": "Stack traces of all leaked goroutines. Use debug=2 as a query parameter to export in the same format as an unrecovered panic.",
 }
 
 type profileEntry struct {
@@ -404,7 +407,7 @@ func Index(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Adding other profiles exposed from within this package
-	for _, p := range []string{"cmdline", "profile", "trace"} {
+	for _, p := range []string{"cmdline", "profile", "symbol", "trace"} {
 		profiles = append(profiles, profileEntry{
 			Name: p,
 			Href: p,
@@ -412,8 +415,8 @@ func Index(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	sort.Slice(profiles, func(i, j int) bool {
-		return profiles[i].Name < profiles[j].Name
+	slices.SortFunc(profiles, func(a, b profileEntry) int {
+		return strings.Compare(a.Name, b.Name)
 	})
 
 	if err := indexTmplExecute(w, profiles); err != nil {

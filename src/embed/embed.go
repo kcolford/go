@@ -90,7 +90,8 @@
 // depending on whether the package wants to make the data available to other packages.
 // It can only be used with variables at package scope, not with local variables.
 //
-// Patterns must not match files outside the package's module, such as ‘.git/*’ or symbolic links.
+// Patterns must not match files outside the package's module, such as ‘.git/*’, symbolic links,
+// 'vendor/', or any directories containing go.mod (these are separate modules).
 // Patterns must not match files whose names include the special punctuation characters  " * < > ? ` ' | / \ and :.
 // Matches for empty directories are ignored. After that, each pattern in a //go:embed line
 // must match at least one file or non-empty directory.
@@ -170,7 +171,7 @@ type FS struct {
 	//
 	//	p       # dir=.    elem=p
 	//	q/      # dir=.    elem=q
-	//	w/      # dir=.    elem=w
+	//	w       # dir=.    elem=w
 	//	q/r     # dir=q    elem=r
 	//	q/s/    # dir=q    elem=s
 	//	q/v     # dir=q    elem=v
@@ -358,12 +359,14 @@ func (f *openFile) Read(b []byte) (int, error) {
 
 func (f *openFile) Seek(offset int64, whence int) (int64, error) {
 	switch whence {
-	case 0:
+	case io.SeekStart:
 		// offset += 0
-	case 1:
+	case io.SeekCurrent:
 		offset += f.offset
-	case 2:
+	case io.SeekEnd:
 		offset += int64(len(f.f.data))
+	default:
+		return 0, &fs.PathError{Op: "seek", Path: f.f.name, Err: fs.ErrInvalid}
 	}
 	if offset < 0 || offset > int64(len(f.f.data)) {
 		return 0, &fs.PathError{Op: "seek", Path: f.f.name, Err: fs.ErrInvalid}
@@ -373,8 +376,11 @@ func (f *openFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *openFile) ReadAt(b []byte, offset int64) (int, error) {
-	if offset < 0 || offset > int64(len(f.f.data)) {
+	if offset < 0 {
 		return 0, &fs.PathError{Op: "read", Path: f.f.name, Err: fs.ErrInvalid}
+	}
+	if offset >= int64(len(f.f.data)) {
+		return 0, io.EOF
 	}
 	n := copy(b, f.f.data[offset:])
 	if n < len(b) {

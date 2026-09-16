@@ -7,9 +7,10 @@
 package runtime
 
 import (
+	"internal/byteorder"
 	"internal/chacha8rand"
 	"internal/goarch"
-	"runtime/internal/math"
+	"math/bits"
 	"unsafe"
 	_ "unsafe" // for go:linkname
 )
@@ -41,14 +42,15 @@ func randinit() {
 	}
 
 	seed := &globalRand.seed
-	if startupRand != nil {
+	if len(startupRand) >= 16 &&
+		// Check that at least the first two words of startupRand weren't
+		// cleared by any libc initialization.
+		!allZero(startupRand[:8]) && !allZero(startupRand[8:16]) {
 		for i, c := range startupRand {
 			seed[i%len(seed)] ^= c
 		}
-		clear(startupRand)
-		startupRand = nil
 	} else {
-		if readRandom(seed[:]) != len(seed) {
+		if readRandom(seed[:]) != len(seed) || allZero(seed[:]) {
 			// readRandom should never fail, but if it does we'd rather
 			// not make Go binaries completely unusable, so make up
 			// some random data based on the current time.
@@ -58,6 +60,25 @@ func randinit() {
 	}
 	globalRand.state.Init(*seed)
 	clear(seed[:])
+
+	if startupRand != nil {
+		// Overwrite startupRand instead of clearing it, in case cgo programs
+		// access it after we used it.
+		for len(startupRand) > 0 {
+			buf := make([]byte, 8)
+			for {
+				if x, ok := globalRand.state.Next(); ok {
+					byteorder.BEPutUint64(buf, x)
+					break
+				}
+				globalRand.state.Refill()
+			}
+			n := copy(startupRand, buf)
+			startupRand = startupRand[n:]
+		}
+		startupRand = nil
+	}
+
 	globalRand.init = true
 	unlock(&globalRand.lock)
 }
@@ -88,7 +109,18 @@ func readTimeRandom(r []byte) {
 	}
 }
 
+func allZero(b []byte) bool {
+	var acc byte
+	for _, x := range b {
+		acc |= x
+	}
+	return acc == 0
+}
+
+// Used in internal/runtime/maps
 // bootstrapRand returns a random uint64 from the global random generator.
+//
+//go:linknamestd bootstrapRand
 func bootstrapRand() uint64 {
 	lock(&globalRand.lock)
 	if !globalRand.init {
@@ -122,6 +154,8 @@ func rand32() uint32 {
 }
 
 // rand returns a random uint64 from the per-m chacha8 state.
+// This is called from compiler-generated code.
+//
 // Do not change signature: used via linkname from other packages.
 //
 //go:nosplit
@@ -148,6 +182,11 @@ func rand() uint64 {
 	}
 }
 
+//go:linkname maps_rand internal/runtime/maps.rand
+func maps_rand() uint64 {
+	return rand()
+}
+
 // mrandinit initializes the random state of an m.
 func mrandinit(mp *m) {
 	var seed [4]uint64
@@ -156,7 +195,8 @@ func mrandinit(mp *m) {
 	}
 	bootstrapRandReseed() // erase key we just extracted
 	mp.chacha8.Init64(seed)
-	mp.cheaprand = rand()
+	mp.cheaprand = uint32(rand())
+	mp.cheaprand64 = rand()
 }
 
 // randn is like rand() % n but faster.
@@ -191,14 +231,12 @@ func randn(n uint32) uint32 {
 func cheaprand() uint32 {
 	mp := getg().m
 	// Implement wyrand: https://github.com/wangyi-fudan/wyhash
-	// Only the platform that math.Mul64 can be lowered
-	// by the compiler should be in this list.
-	if goarch.IsAmd64|goarch.IsArm64|goarch.IsPpc64|
-		goarch.IsPpc64le|goarch.IsMips64|goarch.IsMips64le|
-		goarch.IsS390x|goarch.IsRiscv64|goarch.IsLoong64 == 1 {
-		mp.cheaprand += 0xa0761d6478bd642f
-		hi, lo := math.Mul64(mp.cheaprand, mp.cheaprand^0xe7037ed1a0b428db)
-		return uint32(hi ^ lo)
+	// Only the platform that supports 64-bit multiplication
+	// natively should be allowed.
+	if bits.UintSize == 64 {
+		mp.cheaprand += 0x53c5ca59
+		hi, lo := bits.Mul32(mp.cheaprand, mp.cheaprand^0x74743c1b)
+		return hi ^ lo
 	}
 
 	// Implement xorshift64+: 2 32-bit xorshift sequences added together.
@@ -206,7 +244,7 @@ func cheaprand() uint32 {
 	// Xorshift paper: https://www.jstatsoft.org/article/view/v008i14/xorshift.pdf
 	// This generator passes the SmallCrush suite, part of TestU01 framework:
 	// http://simul.iro.umontreal.ca/testu01/tu01.html
-	t := (*[2]uint32)(unsafe.Pointer(&mp.cheaprand))
+	t := (*[2]uint32)(unsafe.Pointer(&mp.cheaprand64))
 	s1, s0 := t[0], t[1]
 	s1 ^= s1 << 17
 	s1 = s1 ^ s0 ^ s1>>7 ^ s0>>16
@@ -233,7 +271,33 @@ func cheaprand() uint32 {
 //go:linkname cheaprand64
 //go:nosplit
 func cheaprand64() int64 {
-	return int64(cheaprand())<<31 ^ int64(cheaprand())
+	return int64(cheaprandu64() & ^(uint64(1) << 63))
+}
+
+// cheaprandu64 is a non-cryptographic-quality 64-bit random generator
+// suitable for calling at very high frequency (such as during sampling decisions).
+// it is "cheap" in the sense of both expense and quality.
+//
+// cheaprandu64 must not be exported to other packages:
+// the rule is that other packages using runtime-provided
+// randomness must always use rand.
+//
+//go:nosplit
+func cheaprandu64() uint64 {
+	// Implement wyrand: https://github.com/wangyi-fudan/wyhash
+	// Only the platform that bits.Mul64 can be lowered
+	// by the compiler should be in this list.
+	if goarch.IsAmd64|goarch.IsArm64|goarch.IsPpc64|
+		goarch.IsPpc64le|goarch.IsMips64|goarch.IsMips64le|
+		goarch.IsS390x|goarch.IsRiscv64|goarch.IsLoong64 == 1 {
+		mp := getg().m
+		// Implement wyrand: https://github.com/wangyi-fudan/wyhash
+		mp.cheaprand64 += 0xa0761d6478bd642f
+		hi, lo := bits.Mul64(mp.cheaprand64, mp.cheaprand64^0xe7037ed1a0b428db)
+		return hi ^ lo
+	}
+
+	return uint64(cheaprand())<<32 | uint64(cheaprand())
 }
 
 // cheaprandn is like cheaprand() % n but faster.

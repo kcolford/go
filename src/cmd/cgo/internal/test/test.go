@@ -117,8 +117,8 @@ int add(int x, int y) {
 
 // escape vs noescape
 
-// TODO(#56378): enable in Go 1.23:
-// #cgo noescape handleGoStringPointerNoescape
+#cgo noescape handleGoStringPointerNoescape
+#cgo nocallback handleGoStringPointerNoescape
 void handleGoStringPointerNoescape(void *s) {}
 
 void handleGoStringPointerEscape(void *s) {}
@@ -245,7 +245,7 @@ static void *thread(void *p) {
 	return NULL;
 }
 void testSendSIG() {
-	const int N = 20;
+	enum { N = 20 };
 	int i;
 	pthread_t tid[N];
 	for (i = 0; i < N; i++) {
@@ -940,12 +940,74 @@ typedef struct {
 } issue67517struct;
 static void issue67517(issue67517struct* p) {}
 
+// Issue 69086.
+// GCC added the __int128 type in GCC 4.6, released in 2011.
+typedef struct {
+	int a;
+#ifdef __SIZEOF_INT128__
+	unsigned __int128 b;
+#else
+	uint64_t b;
+#endif
+	unsigned char c;
+} issue69086struct;
+static int issue690861(issue69086struct* p) { p->b = 1234; return p->c; }
+static int issue690862(unsigned long ul1, unsigned long ul2, unsigned int u, issue69086struct s) { return (int)(s.b); }
+
+char issue75751v = 1;
+char * const issue75751p = &issue75751v;
+#define issue75751m issue75751p
+char * const volatile issue75751p2 = &issue75751v;
+#define issue75751m2 issue75751p2
+
+typedef struct { void *t; void *v; } GoInterface;
+extern int exportAny76340Param(GoInterface);
+extern GoInterface exportAny76340Return(int);
+
+int issue76340testFromC(GoInterface obj) {
+	return exportAny76340Param(obj);
+}
+
+GoInterface issue76340returnFromC(int val) {
+	return exportAny76340Return(val);
+}
+
+static void enableDIT() {
+	#ifdef __arm64__
+	__asm__ __volatile__("msr dit, #1");
+	#endif
+}
+
+static void disableDIT() {
+	#ifdef __arm64__
+	__asm__ __volatile__("msr dit, #0");
+	#endif
+}
+
+extern uint8_t ditCallback();
+
+static uint8_t ditCallbackTest() {
+	return ditCallback();
+}
+
+static void ditCallbackEnableDIT() {
+	enableDIT();
+	ditCallback();
+}
+
+static void ditCallbackDisableDIT() {
+	disableDIT();
+	ditCallback();
+}
 */
 import "C"
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
+	"internal/asan"
+	"internal/runtime/sys"
 	"math"
 	"math/rand"
 	"os"
@@ -1082,8 +1144,15 @@ func testErrno(t *testing.T) {
 }
 
 func testMultipleAssign(t *testing.T) {
+	if runtime.GOOS == "windows" && usesUCRT(t) {
+		// UCRT's strtol throws an unrecoverable crash when
+		// using an invalid base (that is, not 0 or 2..36).
+		// See go.dev/issue/62887.
+		t.Skip("skipping test on Windows when linking with UCRT")
+	}
 	p := C.CString("234")
 	n, m := C.strtol(p, nil, 345), C.strtol(p, nil, 10)
+	defer C.free(unsafe.Pointer(p))
 	if runtime.GOOS == "openbsd" {
 		// Bug in OpenBSD strtol(3) - base > 36 succeeds.
 		if (n != 0 && n != 239089) || m != 234 {
@@ -1092,7 +1161,6 @@ func testMultipleAssign(t *testing.T) {
 	} else if n != 0 || m != 234 {
 		t.Fatal("Strtol x2: ", n, m)
 	}
-	C.free(unsafe.Pointer(p))
 }
 
 var (
@@ -1618,7 +1686,9 @@ func testNaming(t *testing.T) {
 
 func test6907(t *testing.T) {
 	want := "yarn"
-	if got := C.GoString(C.Issue6907CopyString(want)); got != want {
+	s := C.Issue6907CopyString(want)
+	defer C.free(unsafe.Pointer(s))
+	if got := C.GoString(s); got != want {
 		t.Errorf("C.GoString(C.Issue6907CopyString(%q)) == %q, want %q", want, got, want)
 	}
 }
@@ -1760,6 +1830,9 @@ func issue8331a() C.issue8331 {
 // issue 10303
 
 func test10303(t *testing.T, n int) {
+	if asan.Enabled {
+		t.Skip("variable z is heap-allocated due to extra allocations with -asan; see #70079")
+	}
 	if runtime.Compiler == "gccgo" {
 		t.Skip("gccgo permits C pointers on the stack")
 	}
@@ -1864,6 +1937,7 @@ func test17537(t *testing.T) {
 	}
 
 	p := (*C.char)(C.malloc(1))
+	defer C.free(unsafe.Pointer(p))
 	*p = 17
 	if got, want := C.F17537(&p), C.int(17); got != want {
 		t.Errorf("got %d, want %d", got, want)
@@ -2348,4 +2422,122 @@ func issue67517() {
 		// comment
 		b: nil,
 	})
+}
+
+// Issue 69086.
+func test69086(t *testing.T) {
+	var s C.issue69086struct
+
+	typ := reflect.TypeOf(s)
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		t.Logf("field %d: name %s size %d align %d offset %d", i, f.Name, f.Type.Size(), f.Type.Align(), f.Offset)
+	}
+
+	s.c = 1
+	got := C.issue690861(&s)
+	if got != 1 {
+		t.Errorf("field: got %d, want 1", got)
+	}
+	got = C.issue690862(1, 2, 3, s)
+	if got != 1234 {
+		t.Errorf("call: got %d, want 1234", got)
+	}
+}
+
+// Issue 75751: no runtime test, just make sure it compiles.
+func test75751() int {
+	return int(*C.issue75751m) + int(*C.issue75751m2)
+}
+
+// Issue 76340.
+func test76340(t *testing.T) {
+	var emptyInterface C.GoInterface
+	r1 := C.issue76340testFromC(emptyInterface)
+	if r1 != 0 {
+		t.Errorf("issue76340testFromC with nil interface: got %d, want 0", r1)
+	}
+
+	r2 := C.issue76340returnFromC(42)
+	if r2.t == nil && r2.v == nil {
+		t.Error("issue76340returnFromC(42) returned nil interface")
+	}
+
+	r3 := C.issue76340returnFromC(0)
+	if r3.t != nil || r3.v != nil {
+		t.Errorf("issue76340returnFromC(0) returned non-nil interface: got %v, want nil", r3)
+	}
+}
+
+func testDITCgo(t *testing.T) {
+	if !sys.DITSupported {
+		t.Skip("CPU does not support DIT")
+	}
+
+	ditAlreadyEnabled := sys.DITEnabled()
+	C.enableDIT()
+
+	if ditAlreadyEnabled != sys.DITEnabled() {
+		t.Fatalf("DIT state not preserved across cgo call: before %t, after %t", ditAlreadyEnabled, sys.DITEnabled())
+	}
+
+	subtle.WithDataIndependentTiming(func() {
+		C.disableDIT()
+
+		if !sys.DITEnabled() {
+			t.Fatal("DIT disabled after disabling in cgo call")
+		}
+	})
+}
+
+func testDITCgoCallback(t *testing.T) {
+	if !sys.DITSupported {
+		t.Skip("CPU does not support DIT")
+	}
+
+	ditAlreadyEnabled := sys.DITEnabled()
+
+	subtle.WithDataIndependentTiming(func() {
+		if C.ditCallbackTest() != 1 {
+			t.Fatal("DIT not enabled in cgo callback within WithDataIndependentTiming")
+		}
+	})
+
+	if ditAlreadyEnabled != sys.DITEnabled() {
+		t.Fatalf("DIT state not preserved across cgo callback: before %t, after %t", ditAlreadyEnabled, sys.DITEnabled())
+	}
+}
+
+func testDITCgoCallbackEnableDIT(t *testing.T) {
+	if !sys.DITSupported {
+		t.Skip("CPU does not support DIT")
+	}
+
+	ditAlreadyEnabled := sys.DITEnabled()
+
+	C.ditCallbackEnableDIT()
+
+	if ditAlreadyEnabled != sys.DITEnabled() {
+		t.Fatalf("DIT state not preserved across cgo callback: before %t, after %t", ditAlreadyEnabled, sys.DITEnabled())
+	}
+}
+
+func testDITCgoCallbackDisableDIT(t *testing.T) {
+	if !sys.DITSupported {
+		t.Skip("CPU does not support DIT")
+	}
+
+	ditAlreadyEnabled := sys.DITEnabled()
+
+	subtle.WithDataIndependentTiming(func() {
+		C.ditCallbackDisableDIT()
+
+		if !sys.DITEnabled() {
+			t.Fatal("DIT disabled after disabling in cgo call")
+		}
+	})
+
+	if ditAlreadyEnabled != sys.DITEnabled() {
+		t.Fatalf("DIT state not preserved across cgo callback: before %t, after %t", ditAlreadyEnabled, sys.DITEnabled())
+	}
 }

@@ -12,8 +12,11 @@ import (
 	"sort"
 
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/midway"
 	"cmd/compile/internal/rangefunc"
 	"cmd/compile/internal/syntax"
+	"cmd/compile/internal/typecheck"
+	"cmd/compile/internal/types"
 	"cmd/compile/internal/types2"
 	"cmd/internal/src"
 )
@@ -44,6 +47,9 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info, map[*
 		fileBaseMap[p.file.Pos().FileBase()] = p.file
 	}
 
+	didMidway := false
+
+recheck:
 	// typechecking
 	ctxt := types2.NewContext()
 	importer := gcimports{
@@ -56,7 +62,6 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info, map[*
 		IgnoreBranchErrors: true, // parser already checked via syntax.CheckBranches mode
 		Importer:           &importer,
 		Sizes:              types2.SizesFor("gc", buildcfg.GOARCH),
-		EnableAlias:        true,
 	}
 	if base.Flag.ErrorURL {
 		conf.ErrorURL = " [go.dev/e/%s]"
@@ -144,6 +149,61 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info, map[*
 	}
 	base.ExitIfErrors()
 
+	// Implementation restriction: we don't allow not-in-heap types to
+	// be used as map keys/values, or channel.
+	{
+		for _, file := range files {
+			syntax.Inspect(file, func(n syntax.Node) bool {
+				if n, ok := n.(*syntax.TypeDecl); ok {
+					switch n := n.Type.(type) {
+					case *syntax.MapType:
+						typ := n.GetTypeInfo().Type.Underlying().(*types2.Map)
+						if isNotInHeap(typ.Key()) {
+							base.ErrorfAt(m.makeXPos(n.Pos()), 0, "incomplete (or unallocatable) map key not allowed")
+						}
+						if isNotInHeap(typ.Elem()) {
+							base.ErrorfAt(m.makeXPos(n.Pos()), 0, "incomplete (or unallocatable) map value not allowed")
+						}
+					case *syntax.ChanType:
+						typ := n.GetTypeInfo().Type.Underlying().(*types2.Chan)
+						if isNotInHeap(typ.Elem()) {
+							base.ErrorfAt(m.makeXPos(n.Pos()), 0, "chan of incomplete (or unallocatable) type not allowed")
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+	base.ExitIfErrors()
+
+	if len(base.Debug.AstDump) > 0 {
+		dumpSyntax(pkg, info, files, "checked")
+	}
+
+	if buildcfg.Experiment.SIMD && !didMidway {
+		didMidway = true
+		// Perform midway transformation on AST directly
+		if midway.RewriteWrapper(pkg, info, files) {
+			// midway made changes; type checking must be repeated.
+			if len(base.Debug.AstDump) > 0 {
+				// TODO how should this interact with -W and textual dumps
+				dumpSyntax(pkg, info, files, "midway before recheck")
+			}
+			// necessary to reset type checking
+			for _, p := range types.PkgMap() {
+				p.Direct = false
+			}
+			// necessary to reset type checking
+			typecheck.Target.Imports = nil
+			goto recheck
+		}
+	}
+
+	if len(base.Debug.AstDump) > 0 {
+		dumpSyntax(pkg, info, files, "midway after recheck")
+	}
+
 	// Rewrite range over function to explicit function calls
 	// with the loop bodies converted into new implicit closures.
 	// We do this now, before serialization to unified IR, so that if the
@@ -153,7 +213,23 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info, map[*
 	// and bodyReaderFor will fail.
 	rangeInfo := rangefunc.Rewrite(pkg, info, files)
 
+	if len(base.Debug.AstDump) > 0 {
+		dumpSyntax(pkg, info, files, "rangefunc")
+	}
+
 	return pkg, info, rangeInfo
+}
+
+func dumpSyntax(pkg *types2.Package, info *types2.Info, files []*syntax.File, phase string) {
+	for _, file := range files {
+		for _, decl := range file.DeclList {
+			if fn, ok := decl.(*syntax.FuncDecl); ok {
+				if MatchASTDump(fn) {
+					DumpNodeHTML(pkg, file, info, fn, phase, fn)
+				}
+			}
+		}
+	}
 }
 
 // A cycleFinder detects anonymous interface cycles (go.dev/issue/56103).

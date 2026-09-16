@@ -20,10 +20,12 @@ type SubFS interface {
 // Sub returns an [FS] corresponding to the subtree rooted at fsys's dir.
 //
 // If dir is ".", Sub returns fsys unchanged.
-// Otherwise, if fs implements [SubFS], Sub returns fsys.Sub(dir).
+// Otherwise, if fsys implements [SubFS], Sub returns fsys.Sub(dir).
 // Otherwise, Sub returns a new [FS] implementation sub that,
 // in effect, implements sub.Open(name) as fsys.Open(path.Join(dir, name)).
-// The implementation also translates calls to ReadDir, ReadFile, and Glob appropriately.
+// The implementation also translates calls to ReadDir, ReadFile,
+// ReadLink, Lstat, and Glob appropriately. Sub does not check if the
+// directory currently exists.
 //
 // Note that Sub(os.DirFS("/"), "prefix") is equivalent to os.DirFS("/prefix")
 // and that neither of them guarantees to avoid operating system
@@ -31,6 +33,7 @@ type SubFS interface {
 // does not check for symbolic links inside "/prefix" that point to
 // other directories. That is, [os.DirFS] is not a general substitute for a
 // chroot-style security mechanism, and Sub does not change that fact.
+// Use [os.Root] to constrain access to particular directory trees.
 func Sub(fsys FS, dir string) (FS, error) {
 	if !ValidPath(dir) {
 		return nil, &PathError{Op: "sub", Path: dir, Err: ErrInvalid}
@@ -43,6 +46,12 @@ func Sub(fsys FS, dir string) (FS, error) {
 	}
 	return &subFS{fsys, dir}, nil
 }
+
+var _ FS = (*subFS)(nil)
+var _ ReadDirFS = (*subFS)(nil)
+var _ ReadFileFS = (*subFS)(nil)
+var _ ReadLinkFS = (*subFS)(nil)
+var _ GlobFS = (*subFS)(nil)
 
 type subFS struct {
 	fsys FS
@@ -103,6 +112,30 @@ func (f *subFS) ReadFile(name string) ([]byte, error) {
 	}
 	data, err := ReadFile(f.fsys, full)
 	return data, f.fixErr(err)
+}
+
+func (f *subFS) ReadLink(name string) (string, error) {
+	full, err := f.fullName("readlink", name)
+	if err != nil {
+		return "", err
+	}
+	target, err := ReadLink(f.fsys, full)
+	if err != nil {
+		return "", f.fixErr(err)
+	}
+	return target, nil
+}
+
+func (f *subFS) Lstat(name string) (FileInfo, error) {
+	full, err := f.fullName("lstat", name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := Lstat(f.fsys, full)
+	if err != nil {
+		return nil, f.fixErr(err)
+	}
+	return info, nil
 }
 
 func (f *subFS) Glob(pattern string) ([]string, error) {

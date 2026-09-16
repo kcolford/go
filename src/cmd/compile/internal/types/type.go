@@ -174,7 +174,7 @@ type Type struct {
 	// TARRAY: *Array
 	// TSLICE: Slice
 	// TSSA: string
-	extra interface{}
+	extra any
 
 	// width is the width of this Type in bytes.
 	width int64 // valid if Align > 0
@@ -200,23 +200,15 @@ type Type struct {
 
 	intRegs, floatRegs uint8 // registers needed for ABIInternal
 
-	flags bitset8
+	flags bitset16
 	alg   AlgKind // valid if Align > 0
+
+	tflag uint8
 
 	// size of prefix of object that contains all pointers. valid if Align > 0.
 	// Note that for pointers, this is always PtrSize even if the element type
 	// is NotInHeap. See size.go:PtrDataSize for details.
 	ptrBytes int64
-
-	// For defined (named) generic types, a pointer to the list of type params
-	// (in order) of this type that need to be instantiated. For instantiated
-	// generic types, this is the targs used to instantiate them. These targs
-	// may be typeparams (for re-instantiated types such as Value[T2]) or
-	// concrete types (for fully instantiated types such as Value[int]).
-	// rparams is only set for named types that are generic or are fully
-	// instantiated from a generic type, and is otherwise set to nil.
-	// TODO(danscales): choose a better name.
-	rparams *[]*Type
 }
 
 // Registers returns the number of integer and floating-point
@@ -239,19 +231,29 @@ const (
 	typeRecur
 	typeIsShape  // represents a set of closely related types, for generics
 	typeHasShape // there is a shape somewhere in the type
+	// typeIsFullyInstantiated reports whether a type is fully instantiated generic type; i.e.
+	// an instantiated generic type where all type arguments are non-generic or fully instantiated generic types.
+	typeIsFullyInstantiated
+	typeIsSIMDTag // type is the SIMD marker type
+	typeIsSIMD    // type contains the SIMD marker type
+	typeMethodsComputed
 )
 
-func (t *Type) NotInHeap() bool  { return t.flags&typeNotInHeap != 0 }
-func (t *Type) Noalg() bool      { return t.flags&typeNoalg != 0 }
-func (t *Type) Deferwidth() bool { return t.flags&typeDeferwidth != 0 }
-func (t *Type) Recur() bool      { return t.flags&typeRecur != 0 }
-func (t *Type) IsShape() bool    { return t.flags&typeIsShape != 0 }
-func (t *Type) HasShape() bool   { return t.flags&typeHasShape != 0 }
+func (t *Type) NotInHeap() bool           { return t.flags&typeNotInHeap != 0 }
+func (t *Type) Noalg() bool               { return t.flags&typeNoalg != 0 }
+func (t *Type) Deferwidth() bool          { return t.flags&typeDeferwidth != 0 }
+func (t *Type) Recur() bool               { return t.flags&typeRecur != 0 }
+func (t *Type) IsShape() bool             { return t.flags&typeIsShape != 0 }
+func (t *Type) HasShape() bool            { return t.flags&typeHasShape != 0 }
+func (t *Type) IsFullyInstantiated() bool { return t.flags&typeIsFullyInstantiated != 0 }
+func (t *Type) MethodsComputed() bool     { return t.flags&typeMethodsComputed != 0 }
 
-func (t *Type) SetNotInHeap(b bool)  { t.flags.set(typeNotInHeap, b) }
-func (t *Type) SetNoalg(b bool)      { t.flags.set(typeNoalg, b) }
-func (t *Type) SetDeferwidth(b bool) { t.flags.set(typeDeferwidth, b) }
-func (t *Type) SetRecur(b bool)      { t.flags.set(typeRecur, b) }
+func (t *Type) SetNotInHeap(b bool)           { t.flags.set(typeNotInHeap, b) }
+func (t *Type) SetNoalg(b bool)               { t.flags.set(typeNoalg, b) }
+func (t *Type) SetDeferwidth(b bool)          { t.flags.set(typeDeferwidth, b) }
+func (t *Type) SetRecur(b bool)               { t.flags.set(typeRecur, b) }
+func (t *Type) SetIsFullyInstantiated(b bool) { t.flags.set(typeIsFullyInstantiated, b) }
+func (t *Type) SetMethodsComputed(b bool)     { t.flags.set(typeMethodsComputed, b) }
 
 // Should always do SetHasShape(true) when doing SetIsShape(true).
 func (t *Type) SetIsShape(b bool)  { t.flags.set(typeIsShape, b) }
@@ -280,40 +282,12 @@ func (t *Type) Pos() src.XPos {
 	return src.NoXPos
 }
 
-func (t *Type) RParams() []*Type {
-	if t.rparams == nil {
-		return nil
-	}
-	return *t.rparams
-}
-
-func (t *Type) SetRParams(rparams []*Type) {
-	if len(rparams) == 0 {
-		base.Fatalf("Setting nil or zero-length rparams")
-	}
-	t.rparams = &rparams
-	// HasShape should be set if any type argument is or has a shape type.
-	for _, rparam := range rparams {
-		if rparam.HasShape() {
-			t.SetHasShape(true)
-			break
-		}
-	}
-}
-
-// IsFullyInstantiated reports whether t is a fully instantiated generic type; i.e. an
-// instantiated generic type where all type arguments are non-generic or fully
-// instantiated generic types.
-func (t *Type) IsFullyInstantiated() bool {
-	return len(t.RParams()) > 0
-}
-
 // Map contains Type fields specific to maps.
 type Map struct {
 	Key  *Type // Key type
 	Elem *Type // Val (elem) type
 
-	Bucket *Type // internal struct type representing a hash bucket
+	Group *Type // internal struct type representing a slot group
 }
 
 // MapType returns t's extra map-specific fields.
@@ -361,7 +335,7 @@ func (t *Type) funcType() *Func {
 	return t.extra.(*Func)
 }
 
-// StructType contains Type fields specific to struct types.
+// Struct contains Type fields specific to struct types.
 type Struct struct {
 	fields fields
 
@@ -392,7 +366,7 @@ type ChanArgs struct {
 	T *Type // reference to a chan type whose elements need a width check
 }
 
-// // FuncArgs contains Type fields specific to TFUNCARGS types.
+// FuncArgs contains Type fields specific to TFUNCARGS types.
 type FuncArgs struct {
 	T *Type // reference to a func type whose elements need a width check
 }
@@ -454,8 +428,10 @@ type Field struct {
 	// the function name node.
 	Nname Object
 
-	// Offset in bytes of this field or method within its enclosing struct
-	// or interface Type. For parameters, this is BADWIDTH.
+	// Offset in bytes of this field within its enclosing struct. For interface
+	// methods, this is the byte offset of the method's entry in an itab's Fun
+	// array. For promoted, non-interface methods, this is the offset from the
+	// wrapper receiver to the wrapped receiver. For parameters, this is BADWIDTH.
 	Offset int64
 }
 
@@ -478,6 +454,11 @@ func (f *Field) End() int64 {
 // IsMethod reports whether f represents a method rather than a struct field.
 func (f *Field) IsMethod() bool {
 	return f.Type.kind == TFUNC && f.Type.Recv() != nil
+}
+
+// CompareFields compares two Field values by name.
+func CompareFields(a, b *Field) int {
+	return CompareSyms(a.Sym, b.Sym)
 }
 
 // fields is a pointer to a slice of *Field.
@@ -619,6 +600,12 @@ func NewResults(types []*Type) *Type {
 func newSSA(name string) *Type {
 	t := newType(TSSA)
 	t.extra = name
+	return t
+}
+
+func newSIMD(name string) *Type {
+	t := newSSA(name)
+	t.flags |= typeIsSIMD
 	return t
 }
 
@@ -1010,17 +997,16 @@ func (t *Type) ArgWidth() int64 {
 	return t.extra.(*Func).Argwid
 }
 
+// Size returns the width of t in bytes.
 func (t *Type) Size() int64 {
 	if t.kind == TSSA {
-		if t == TypeInt128 {
-			return 16
-		}
-		return 0
+		return t.width
 	}
 	CalcSize(t)
 	return t.width
 }
 
+// Alignment returns the alignment of t in bytes.
 func (t *Type) Alignment() int64 {
 	CalcSize(t)
 	return int64(t.align)
@@ -1206,23 +1192,20 @@ func (t *Type) cmp(x *Type) Cmp {
 		// by the general code after the switch.
 
 	case TSTRUCT:
+		// Is this a map group type?
 		if t.StructType().Map == nil {
 			if x.StructType().Map != nil {
 				return CMPlt // nil < non-nil
 			}
-			// to the fallthrough
+			// to the general case
 		} else if x.StructType().Map == nil {
 			return CMPgt // nil > non-nil
-		} else if t.StructType().Map.MapType().Bucket == t {
-			// Both have non-nil Map
-			// Special case for Maps which include a recursive type where the recursion is not broken with a named type
-			if x.StructType().Map.MapType().Bucket != x {
-				return CMPlt // bucket maps are least
-			}
-			return t.StructType().Map.cmp(x.StructType().Map)
-		} else if x.StructType().Map.MapType().Bucket == x {
-			return CMPgt // bucket maps are least
-		} // If t != t.Map.Bucket, fall through to general case
+		}
+		// Both have non-nil Map, fallthrough to the general
+		// case. Note that the map type does not directly refer
+		// to the group type (it uses unsafe.Pointer). If it
+		// did, this would need special handling to avoid
+		// infinite recursion.
 
 		tfs := t.Fields()
 		xfs := x.Fields()
@@ -1629,12 +1612,26 @@ var (
 	TypeFlags     = newSSA("flags")
 	TypeVoid      = newSSA("void")
 	TypeInt128    = newSSA("int128")
+	TypeVec128    = newSIMD("vec128")
+	TypeVec256    = newSIMD("vec256")
+	TypeVec512    = newSIMD("vec512")
+	TypeMask      = newSIMD("mask") // not a vector, not 100% sure what this should be.
 	TypeResultMem = newResults([]*Type{TypeMem})
 )
 
 func init() {
 	TypeInt128.width = 16
 	TypeInt128.align = 8
+
+	TypeVec128.width = 16
+	TypeVec128.align = 8
+	TypeVec256.width = 32
+	TypeVec256.align = 8
+	TypeVec512.width = 64
+	TypeVec512.align = 8
+
+	TypeMask.width = 8 // This will depend on the architecture; spilling will be "interesting".
+	TypeMask.align = 8
 }
 
 // NewNamed returns a new named type for the given type name. obj should be an
@@ -1650,7 +1647,7 @@ func NewNamed(obj Object) *Type {
 		t.SetIsShape(true)
 		t.SetHasShape(true)
 	}
-	if sym.Pkg.Path == "runtime/internal/sys" && sym.Name == "nih" {
+	if sym.Pkg.Path == "internal/runtime/sys" && sym.Name == "nih" {
 		// Recognize the special not-in-heap type. Any type including
 		// this type will also be not-in-heap.
 		// This logic is duplicated in go/types and
@@ -1694,6 +1691,9 @@ func (t *Type) SetUnderlying(underlying *Type) {
 	if underlying.HasShape() {
 		t.SetHasShape(true)
 	}
+	if underlying.flags&typeIsSIMD != 0 {
+		simdify(t, underlying.flags&typeIsSIMDTag != 0)
+	}
 
 	// spec: "The declared type does not inherit any methods bound
 	// to the existing type, but the method set of an interface
@@ -1723,13 +1723,6 @@ func fieldsHasShape(fields []*Field) bool {
 		}
 	}
 	return false
-}
-
-// newBasic returns a new basic type of the given kind.
-func newBasic(kind Kind, obj Object) *Type {
-	t := newType(kind)
-	t.obj = obj
-	return t
 }
 
 // NewInterface returns a new interface for the given methods and
@@ -1860,26 +1853,7 @@ func IsReflexive(t *Type) bool {
 // Can this type be stored directly in an interface word?
 // Yes, if the representation is a single pointer.
 func IsDirectIface(t *Type) bool {
-	switch t.Kind() {
-	case TPTR:
-		// Pointers to notinheap types must be stored indirectly. See issue 42076.
-		return !t.Elem().NotInHeap()
-	case TCHAN,
-		TMAP,
-		TFUNC,
-		TUNSAFEPTR:
-		return true
-
-	case TARRAY:
-		// Array of 1 direct iface type can be direct.
-		return t.NumElem() == 1 && IsDirectIface(t.Elem())
-
-	case TSTRUCT:
-		// Struct with 1 field of direct iface type can be direct.
-		return t.NumFields() == 1 && IsDirectIface(t.Field(0).Type)
-	}
-
-	return false
+	return t.Size() == int64(PtrSize) && PtrDataSize(t) == int64(PtrSize)
 }
 
 // IsInterfaceMethod reports whether (field) m is
@@ -1925,6 +1899,11 @@ func IsNoInstrumentPkg(p *Pkg) bool {
 // should not be race instrumented.
 func IsNoRacePkg(p *Pkg) bool {
 	return objabi.LookupPkgSpecial(p.Path).NoRaceFunc
+}
+
+// IsRuntimePkg reports whether p is a runtime package.
+func IsRuntimePkg(p *Pkg) bool {
+	return objabi.LookupPkgSpecial(p.Path).Runtime
 }
 
 // ReceiverBaseType returns the underlying type, if any,
@@ -2015,3 +1994,7 @@ var SimType [NTYPE]Kind
 
 // Fake package for shape types (see typecheck.Shapify()).
 var ShapePkg = NewPkg("go.shape", "go.shape")
+
+func (t *Type) IsSIMD() bool {
+	return t.flags&typeIsSIMD != 0
+}

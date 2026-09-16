@@ -5,6 +5,7 @@
 package slog
 
 import (
+	"bytes"
 	"context"
 	"log"
 	loginternal "log/internal"
@@ -96,9 +97,7 @@ func (w *handlerWriter) Write(buf []byte) (int, error) {
 
 	// Remove final newline.
 	origLen := len(buf) // Report that the entire buf was written.
-	if len(buf) > 0 && buf[len(buf)-1] == '\n' {
-		buf = buf[:len(buf)-1]
-	}
+	buf = bytes.TrimSuffix(buf, []byte{'\n'})
 	r := NewRecord(time.Now(), level, string(buf), pc)
 	return origLen, w.h.Handle(context.Background(), r)
 }
@@ -196,6 +195,8 @@ func (l *Logger) LogAttrs(ctx context.Context, level Level, msg string, attrs ..
 }
 
 // Debug logs at [LevelDebug].
+// It uses [context.Background] internally; to specify the context, use
+// [Logger.DebugContext].
 func (l *Logger) Debug(msg string, args ...any) {
 	l.log(context.Background(), LevelDebug, msg, args...)
 }
@@ -206,6 +207,8 @@ func (l *Logger) DebugContext(ctx context.Context, msg string, args ...any) {
 }
 
 // Info logs at [LevelInfo].
+// It uses [context.Background] internally; to specify the context, use
+// [Logger.InfoContext].
 func (l *Logger) Info(msg string, args ...any) {
 	l.log(context.Background(), LevelInfo, msg, args...)
 }
@@ -216,6 +219,8 @@ func (l *Logger) InfoContext(ctx context.Context, msg string, args ...any) {
 }
 
 // Warn logs at [LevelWarn].
+// It uses [context.Background] internally; to specify the context, use
+// [Logger.WarnContext].
 func (l *Logger) Warn(msg string, args ...any) {
 	l.log(context.Background(), LevelWarn, msg, args...)
 }
@@ -226,6 +231,8 @@ func (l *Logger) WarnContext(ctx context.Context, msg string, args ...any) {
 }
 
 // Error logs at [LevelError].
+// It uses [context.Background] internally; to specify the context, use
+// [Logger.ErrorContext].
 func (l *Logger) Error(msg string, args ...any) {
 	l.log(context.Background(), LevelError, msg, args...)
 }
@@ -239,6 +246,9 @@ func (l *Logger) ErrorContext(ctx context.Context, msg string, args ...any) {
 // It must always be called directly by an exported logging method
 // or function, because it uses a fixed call depth to obtain the pc.
 func (l *Logger) log(ctx context.Context, level Level, msg string, args ...any) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !l.Enabled(ctx, level) {
 		return
 	}
@@ -251,14 +261,14 @@ func (l *Logger) log(ctx context.Context, level Level, msg string, args ...any) 
 	}
 	r := NewRecord(time.Now(), level, msg, pc)
 	r.Add(args...)
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	_ = l.Handler().Handle(ctx, r)
 }
 
 // logAttrs is like [Logger.log], but for methods that take ...Attr.
 func (l *Logger) logAttrs(ctx context.Context, level Level, msg string, attrs ...Attr) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !l.Enabled(ctx, level) {
 		return
 	}
@@ -271,13 +281,12 @@ func (l *Logger) logAttrs(ctx context.Context, level Level, msg string, attrs ..
 	}
 	r := NewRecord(time.Now(), level, msg, pc)
 	r.AddAttrs(attrs...)
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	_ = l.Handler().Handle(ctx, r)
 }
 
 // Debug calls [Logger.Debug] on the default logger.
+// It uses [context.Background] internally; to specify the context, use
+// [DebugContext].
 func Debug(msg string, args ...any) {
 	Default().log(context.Background(), LevelDebug, msg, args...)
 }
@@ -288,6 +297,8 @@ func DebugContext(ctx context.Context, msg string, args ...any) {
 }
 
 // Info calls [Logger.Info] on the default logger.
+// It uses [context.Background] internally; to specify the context, use
+// [InfoContext].
 func Info(msg string, args ...any) {
 	Default().log(context.Background(), LevelInfo, msg, args...)
 }
@@ -298,6 +309,8 @@ func InfoContext(ctx context.Context, msg string, args ...any) {
 }
 
 // Warn calls [Logger.Warn] on the default logger.
+// It uses [context.Background] internally; to specify the context, use
+// [WarnContext].
 func Warn(msg string, args ...any) {
 	Default().log(context.Background(), LevelWarn, msg, args...)
 }
@@ -308,6 +321,8 @@ func WarnContext(ctx context.Context, msg string, args ...any) {
 }
 
 // Error calls [Logger.Error] on the default logger.
+// It uses [context.Background] internally; to specify the context, use
+// [ErrorContext].
 func Error(msg string, args ...any) {
 	Default().log(context.Background(), LevelError, msg, args...)
 }

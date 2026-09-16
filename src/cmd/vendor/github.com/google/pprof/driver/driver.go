@@ -17,6 +17,7 @@ package driver
 
 import (
 	"io"
+	"maps"
 	"net/http"
 	"regexp"
 	"time"
@@ -186,10 +187,11 @@ type ObjFile interface {
 
 // A Frame describes a single line in a source file.
 type Frame struct {
-	Func   string // name of function
-	File   string // source file name
-	Line   int    // line in file
-	Column int    // column in file
+	Func      string // name of function
+	File      string // source file name
+	Line      int    // line in file
+	Column    int    // column in file
+	StartLine int    // start line of function (if available)
 }
 
 // A Sym describes a single symbol in an object file.
@@ -292,8 +294,6 @@ type internalSymbolizer struct {
 
 func (s *internalSymbolizer) Symbolize(mode string, srcs plugin.MappingSources, prof *profile.Profile) error {
 	isrcs := MappingSources{}
-	for m, s := range srcs {
-		isrcs[m] = s
-	}
+	maps.Copy(isrcs, srcs)
 	return s.Symbolizer.Symbolize(mode, isrcs, prof)
 }

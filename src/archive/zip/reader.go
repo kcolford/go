@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"hash/crc32"
 	"internal/godebug"
@@ -62,7 +63,6 @@ type File struct {
 	zip          *Reader
 	zipr         io.ReaderAt
 	headerOffset int64 // includes overall ZIP archive baseOffset
-	zip64        bool  // zip64 extended information extra field presence
 }
 
 // OpenReader will open the Zip file specified by name and return a ReadCloser.
@@ -405,10 +405,6 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 		f.NonUTF8 = f.Flags&0x800 == 0
 	}
 
-	needUSize := f.UncompressedSize == ^uint32(0)
-	needCSize := f.CompressedSize == ^uint32(0)
-	needHeaderOffset := f.headerOffset == int64(^uint32(0))
-
 	// Best effort to find what we need.
 	// Other zip authors might not even follow the basic format,
 	// and we'll just ignore the Extra content in that case.
@@ -424,28 +420,23 @@ parseExtras:
 
 		switch fieldTag {
 		case zip64ExtraID:
-			f.zip64 = true
-
 			// update directory values from the zip64 extra block.
 			// They should only be consulted if the sizes read earlier
 			// are maxed out.
-			// See golang.org/issue/13367.
-			if needUSize {
-				needUSize = false
+			// See go.dev/issue/13367 and go.dev/issue/31692.
+			if f.UncompressedSize == ^uint32(0) {
 				if len(fieldBuf) < 8 {
 					return ErrFormat
 				}
 				f.UncompressedSize64 = fieldBuf.uint64()
 			}
-			if needCSize {
-				needCSize = false
+			if f.CompressedSize == ^uint32(0) {
 				if len(fieldBuf) < 8 {
 					return ErrFormat
 				}
 				f.CompressedSize64 = fieldBuf.uint64()
 			}
-			if needHeaderOffset {
-				needHeaderOffset = false
+			if f.headerOffset == int64(^uint32(0)) {
 				if len(fieldBuf) < 8 {
 					return ErrFormat
 				}
@@ -506,20 +497,6 @@ parseExtras:
 		if f.ModifiedTime != 0 || f.ModifiedDate != 0 {
 			f.Modified = modified.In(timeZone(msdosModified.Sub(modified)))
 		}
-	}
-
-	// Assume that uncompressed size 2³²-1 could plausibly happen in
-	// an old zip32 file that was sharding inputs into the largest chunks
-	// possible (or is just malicious; search the web for 42.zip).
-	// If needUSize is true still, it means we didn't see a zip64 extension.
-	// As long as the compressed size is not also 2³²-1 (implausible)
-	// and the header is not also 2³²-1 (equally implausible),
-	// accept the uncompressed size 2³²-1 as valid.
-	// If nothing else, this keeps archive/zip working with 42.zip.
-	_ = needUSize
-
-	if needCSize || needHeaderOffset {
-		return ErrFormat
 	}
 
 	return nil
@@ -604,7 +581,7 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, baseOffset 
 	d.comment = string(b[:l])
 
 	// These values mean that the file can be a zip64 file
-	if d.directoryRecords == 0xffff || d.directorySize == 0xffff || d.directoryOffset == 0xffffffff {
+	if d.directoryRecords == 0xffff || d.directorySize == 0xffffffff || d.directoryOffset == 0xffffffff {
 		p, err := findDirectory64End(r, directoryEndOffset)
 		if err == nil && p >= 0 {
 			directoryEndOffset = p
@@ -804,6 +781,9 @@ func toValidName(name string) string {
 
 func (r *Reader) initFileList() {
 	r.fileListOnce.Do(func() {
+		// Preallocate the minimum size of the index.
+		// We may also synthesize additional directory entries.
+		r.fileList = make([]fileListEntry, 0, len(r.File))
 		// files and knownDirs map from a file/directory name
 		// to an index into the r.fileList entry that we are
 		// building. They are used to mark duplicate entries.
@@ -830,7 +810,16 @@ func (r *Reader) initFileList() {
 				continue
 			}
 
-			for dir := path.Dir(name); dir != "."; dir = path.Dir(dir) {
+			dir := name
+			for {
+				if idx := strings.LastIndex(dir, "/"); idx < 0 {
+					break
+				} else {
+					dir = dir[:idx]
+				}
+				if dirs[dir] {
+					break
+				}
 				dirs[dir] = true
 			}
 
@@ -902,14 +891,8 @@ func (r *Reader) Open(name string) (fs.File, error) {
 }
 
 func split(name string) (dir, elem string, isDir bool) {
-	if len(name) > 0 && name[len(name)-1] == '/' {
-		isDir = true
-		name = name[:len(name)-1]
-	}
-	i := len(name) - 1
-	for i >= 0 && name[i] != '/' {
-		i--
-	}
+	name, isDir = strings.CutSuffix(name, "/")
+	i := strings.LastIndexByte(name, '/')
 	if i < 0 {
 		return ".", name, isDir
 	}
@@ -991,6 +974,12 @@ func (d *openDir) ReadDir(count int) ([]fs.DirEntry, error) {
 		s, err := d.files[d.offset+i].stat()
 		if err != nil {
 			return nil, err
+		} else if s.Name() == "." || !fs.ValidPath(s.Name()) {
+			return nil, &fs.PathError{
+				Op:   "readdir",
+				Path: d.e.name,
+				Err:  fmt.Errorf("invalid file name: %v", d.files[d.offset+i].name),
+			}
 		}
 		list[i] = s
 	}

@@ -51,20 +51,19 @@ type location struct {
 	// For non-PPARAMOUT variables it's 0.
 	resultIndex int
 
-	// derefs and walkgen are used during walkOne to track the
+	// derefs and walkgen are used during walk to track the
 	// minimal dereferences from the walk root.
 	derefs  int // >= -1
 	walkgen uint32
 
-	// dst and dstEdgeindex track the next immediate assignment
-	// destination location during walkone, along with the index
-	// of the edge pointing back to this location.
-	dst        *location
-	dstEdgeIdx int
+	// queuedWalkAll is used by walkAll to track whether this location is
+	// in its work queue.
+	queuedWalkAll bool
 
-	// queued is used by walkAll to track whether this location is
-	// in the walk queue.
-	queued bool
+	// queuedWalk is used by walk to track whether this location is
+	// in its work queue. The value is the walkgen when this location was
+	// last queued for walk, or 0 if it's not currently queued.
+	queuedWalk uint32
 
 	// attrs is a bitset of location attributes.
 	attrs locAttr
@@ -75,6 +74,8 @@ type location struct {
 	captured   bool // has a closure captured this variable?
 	reassigned bool // has this variable been reassigned?
 	addrtaken  bool // has this variable's address been taken?
+	param      bool // is this variable a parameter (ONAME of class ir.PPARAM)?
+	paramOut   bool // is this variable an out parameter (ONAME of class ir.PPARAMOUT)?
 }
 
 type locAttr uint8
@@ -122,35 +123,6 @@ func (l *location) leakTo(sink *location, derefs int) {
 	if !sink.hasAttr(attrEscapes) && sink.isName(ir.PPARAMOUT) && sink.curfn == l.curfn {
 		ri := sink.resultIndex - 1
 		if ri < numEscResults {
-			// Leak to result parameter.
-			l.paramEsc.AddResult(ri, derefs)
-			return
-		}
-	}
-
-	// Otherwise, record as heap leak.
-	l.paramEsc.AddHeap(derefs)
-}
-
-// leakTo records that parameter l leaks to sink.
-func (b *batch) leakTo(l, sink *location, derefs int) {
-	if (logopt.Enabled() || base.Flag.LowerM >= 2) && !l.hasAttr(attrEscapes) {
-		if base.Flag.LowerM >= 2 {
-			fmt.Printf("%s: parameter %v leaks to %s with derefs=%d:\n", base.FmtPos(l.n.Pos()), l.n, b.explainLoc(sink), derefs)
-		}
-		explanation := b.explainPath(sink, l)
-		if logopt.Enabled() {
-			var e_curfn *ir.Func // TODO(mdempsky): Fix.
-			logopt.LogOpt(l.n.Pos(), "leak", "escape", ir.FuncName(e_curfn),
-				fmt.Sprintf("parameter %v leaks to %s with derefs=%d", l.n, b.explainLoc(sink), derefs), explanation)
-		}
-	}
-
-	// If sink is a result parameter that doesn't escape (#44614)
-	// and we can fit return bits into the escape analysis tag,
-	// then record as a result leak.
-	if !sink.hasAttr(attrEscapes) && sink.isName(ir.PPARAMOUT) && sink.curfn == l.curfn {
-		if ri := sink.resultIndex - 1; ri < numEscResults {
 			// Leak to result parameter.
 			l.paramEsc.AddResult(ri, derefs)
 			return
@@ -234,7 +206,7 @@ func (b *batch) flow(k hole, src *location) {
 		if base.Flag.LowerM >= 2 || logopt.Enabled() {
 			pos := base.FmtPos(src.n.Pos())
 			if base.Flag.LowerM >= 2 {
-				fmt.Printf("%s: %v escapes to heap:\n", pos, src.n)
+				fmt.Printf("%s: %v escapes to heap in %v:\n", pos, src.n, ir.FuncName(src.curfn))
 			}
 			explanation := b.explainFlow(pos, dst, src, k.derefs, k.notes, []*logopt.LoggedOpt{})
 			if logopt.Enabled() {
@@ -281,6 +253,12 @@ func (e *escape) newLoc(n ir.Node, persists bool) *location {
 		curfn:     e.curfn,
 		loopDepth: e.loopDepth,
 	}
+	if loc.isName(ir.PPARAM) {
+		loc.param = true
+	} else if loc.isName(ir.PPARAMOUT) {
+		loc.paramOut = true
+	}
+
 	if persists {
 		loc.attrs |= attrPersists
 	}

@@ -18,16 +18,19 @@ import (
 	"go/token"
 	"internal/buildcfg"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"cmd/internal/edit"
-	"cmd/internal/notsha256"
+	"cmd/internal/hash"
 	"cmd/internal/objabi"
+	"cmd/internal/par"
 	"cmd/internal/telemetry/counter"
 )
 
@@ -47,8 +50,6 @@ type Package struct {
 	GoFiles     []string        // list of Go files
 	GccFiles    []string        // list of gcc output files
 	Preamble    string          // collected preamble for _cgo_export.h
-	typedefs    map[string]bool // type names that appear in the types of the objects we're interested in
-	typedefList []typedefInfo
 	noCallbacks map[string]bool // C function names with #cgo nocallback directive
 	noEscapes   map[string]bool // C function names with #cgo noescape directive
 }
@@ -71,9 +72,11 @@ type File struct {
 	ExpFunc     []*ExpFunc          // exported functions for this file
 	Name        map[string]*Name    // map from Go name to Name
 	NamePos     map[*Name]token.Pos // map from Name to position of the first reference
-	NoCallbacks map[string]bool     // C function names that with #cgo nocallback directive
-	NoEscapes   map[string]bool     // C function names that with #cgo noescape directive
+	NoCallbacks map[string]bool     // C function names with #cgo nocallback directive
+	NoEscapes   map[string]bool     // C function names with #cgo noescape directive
 	Edit        *edit.Buffer
+
+	debugs []*debug // debug data from iterations of gccDebug. Initialized by File.loadDebug.
 }
 
 func (f *File) offset(p token.Pos) int {
@@ -81,7 +84,7 @@ func (f *File) offset(p token.Pos) int {
 }
 
 func nameKeys(m map[string]*Name) []string {
-	var ks []string
+	ks := make([]string, 0, len(m))
 	for k := range m {
 		ks = append(ks, k)
 	}
@@ -145,7 +148,7 @@ type ExpFunc struct {
 // A TypeRepr contains the string representation of a type.
 type TypeRepr struct {
 	Repr       string
-	FormatArgs []interface{}
+	FormatArgs []any
 }
 
 // A Type collects information about a type in both the C and Go worlds.
@@ -159,11 +162,36 @@ type Type struct {
 	BadPointer bool // this pointer type should be represented as a uintptr (deprecated)
 }
 
+func (t *Type) fuzzyMatch(t2 *Type) bool {
+	if t == nil || t2 == nil {
+		return false
+	}
+	return t.Size == t2.Size && t.Align == t2.Align
+}
+
 // A FuncType collects information about a function type in both the C and Go worlds.
 type FuncType struct {
 	Params []*Type
 	Result *Type
 	Go     *ast.FuncType
+}
+
+func (t *FuncType) fuzzyMatch(t2 *FuncType) bool {
+	if t == nil || t2 == nil {
+		return false
+	}
+	if !t.Result.fuzzyMatch(t2.Result) {
+		return false
+	}
+	if len(t.Params) != len(t2.Params) {
+		return false
+	}
+	for i := range t.Params {
+		if !t.Params[i].fuzzyMatch(t2.Params[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func usage() {
@@ -292,6 +320,10 @@ func main() {
 		conf.Mode &^= printer.SourcePos
 	}
 
+	if *objDir == "" {
+		*objDir = "_obj"
+	}
+
 	args := flag.Args()
 	if len(args) < 1 {
 		usage()
@@ -362,9 +394,11 @@ func main() {
 	// we use to coordinate between gcc and ourselves.
 	// We already put _cgo_ at the beginning, so the main
 	// concern is other cgo wrappers for the same functions.
-	// Use the beginning of the notsha256 of the input to disambiguate.
-	h := notsha256.New()
+	// Use the beginning of the 16 bytes hash of the input to disambiguate.
+	h := hash.New32()
 	io.WriteString(h, *importPath)
+	var once sync.Once
+	q := par.NewQueue(runtime.GOMAXPROCS(0))
 	fs := make([]*File, len(goFiles))
 	for i, input := range goFiles {
 		if *srcDir != "" {
@@ -386,32 +420,35 @@ func main() {
 			fatalf("%s", err)
 		}
 
-		// Apply trimpath to the file path. The path won't be read from after this point.
-		input, _ = objabi.ApplyRewrites(input, *trimpath)
-		if strings.ContainsAny(input, "\r\n") {
-			// ParseGo, (*Package).writeOutput, and printer.Fprint in SourcePos mode
-			// all emit line directives, which don't permit newlines in the file path.
-			// Bail early if we see anything newline-like in the trimmed path.
-			fatalf("input path contains newline character: %q", input)
-		}
-		goFiles[i] = input
+		q.Add(func() {
+			// Apply trimpath to the file path. The path won't be read from after this point.
+			input, _ = objabi.ApplyRewrites(input, *trimpath)
+			if strings.ContainsAny(input, "\r\n") {
+				// ParseGo, (*Package).writeOutput, and printer.Fprint in SourcePos mode
+				// all emit line directives, which don't permit newlines in the file path.
+				// Bail early if we see anything newline-like in the trimmed path.
+				fatalf("input path contains newline character: %q", input)
+			}
+			goFiles[i] = input
 
-		f := new(File)
-		f.Edit = edit.NewBuffer(b)
-		f.ParseGo(input, b)
-		f.ProcessCgoDirectives()
-		fs[i] = f
+			f := new(File)
+			f.Edit = edit.NewBuffer(b)
+			f.ParseGo(input, b)
+			f.ProcessCgoDirectives()
+			gccIsClang := f.loadDefines(p.GccOptions)
+			once.Do(func() {
+				p.GccIsClang = gccIsClang
+			})
+
+			fs[i] = f
+
+			f.loadDebug(p)
+		})
 	}
+
+	<-q.Idle()
 
 	cPrefix = fmt.Sprintf("_%x", h.Sum(nil)[0:6])
-
-	if *objDir == "" {
-		*objDir = "_obj"
-	}
-	// make sure that `objDir` directory exists, so that we can write
-	// all the output files there.
-	os.MkdirAll(*objDir, 0o700)
-	*objDir += string(filepath.Separator)
 
 	for i, input := range goFiles {
 		f := fs[i]
@@ -515,30 +552,52 @@ func (p *Package) Record(f *File) {
 	if p.Name == nil {
 		p.Name = f.Name
 	} else {
+		// Merge the new file's names in with the existing names.
 		for k, v := range f.Name {
 			if p.Name[k] == nil {
+				// Never seen before, just save it.
 				p.Name[k] = v
-			} else if p.incompleteTypedef(p.Name[k].Type) {
+			} else if p.incompleteTypedef(p.Name[k].Type) && p.Name[k].FuncType == nil {
+				// Old one is incomplete, just use new one.
 				p.Name[k] = v
-			} else if p.incompleteTypedef(v.Type) {
+			} else if p.incompleteTypedef(v.Type) && v.FuncType == nil {
+				// New one is incomplete, just use old one.
 				// Nothing to do.
 			} else if _, ok := nameToC[k]; ok {
 				// Names we predefine may appear inconsistent
 				// if some files typedef them and some don't.
 				// Issue 26743.
 			} else if !reflect.DeepEqual(p.Name[k], v) {
-				error_(token.NoPos, "inconsistent definitions for C.%s", fixGo(k))
+				// We don't require strict func type equality, because some functions
+				// can have things like typedef'd arguments that are equivalent to
+				// the standard arguments. e.g.
+				//     int usleep(unsigned);
+				//     int usleep(useconds_t);
+				// So we just check size/alignment of arguments. At least that
+				// avoids problems like those in #67670 and #67699.
+				ok := false
+				ft1 := p.Name[k].FuncType
+				ft2 := v.FuncType
+				if ft1.fuzzyMatch(ft2) {
+					// Retry DeepEqual with the FuncType field cleared.
+					x1 := *p.Name[k]
+					x2 := *v
+					x1.FuncType = nil
+					x2.FuncType = nil
+					if reflect.DeepEqual(&x1, &x2) {
+						ok = true
+					}
+				}
+				if !ok {
+					error_(token.NoPos, "inconsistent definitions for C.%s", fixGo(k))
+				}
 			}
 		}
 	}
 
 	// merge nocallback & noescape
-	for k, v := range f.NoCallbacks {
-		p.noCallbacks[k] = v
-	}
-	for k, v := range f.NoEscapes {
-		p.noEscapes[k] = v
-	}
+	maps.Copy(p.noCallbacks, f.NoCallbacks)
+	maps.Copy(p.noEscapes, f.NoEscapes)
 
 	if f.ExpFunc != nil {
 		p.ExpFunc = append(p.ExpFunc, f.ExpFunc...)

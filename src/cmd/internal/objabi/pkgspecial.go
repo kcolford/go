@@ -18,6 +18,8 @@ type PkgSpecial struct {
 	//
 	// - Optimizations are always enabled.
 	//
+	// - Checkptr is always disabled.
+	//
 	// This should be set for runtime and all packages it imports, and may be
 	// set for additional packages.
 	Runtime bool
@@ -41,13 +43,21 @@ type PkgSpecial struct {
 }
 
 var runtimePkgs = []string{
+	// TODO(panjf2000): consider syncing the list inside the
+	// 	isAsyncSafePoint in preempt.go based on this list?
+
 	"runtime",
 
 	"internal/runtime/atomic",
+	"internal/runtime/cgroup",
 	"internal/runtime/exithook",
-	"runtime/internal/math",
-	"runtime/internal/sys",
-	"internal/runtime/syscall",
+	"internal/runtime/gc",
+	"internal/runtime/gc/scan",
+	"internal/runtime/maps",
+	"internal/runtime/math",
+	"internal/runtime/sys",
+	"internal/runtime/syscall/linux",
+	"internal/runtime/syscall/windows",
 
 	"internal/abi",
 	"internal/bytealg",
@@ -60,6 +70,7 @@ var runtimePkgs = []string{
 	"internal/goexperiment",
 	"internal/goos",
 	"internal/profilerecord",
+	"internal/strconv",
 	"internal/stringslite",
 }
 
@@ -77,7 +88,7 @@ var extraNoInstrumentPkgs = []string{
 	"-internal/bytealg",
 }
 
-var noRaceFuncPkgs = []string{"sync", "sync/atomic", "internal/runtime/atomic"}
+var noRaceFuncPkgs = []string{"sync", "sync/atomic", "internal/sync", "internal/runtime/atomic"}
 
 var allowAsmABIPkgs = []string{
 	"runtime",
@@ -85,43 +96,42 @@ var allowAsmABIPkgs = []string{
 	"syscall",
 	"internal/bytealg",
 	"internal/chacha8rand",
-	"internal/runtime/syscall",
-	"runtime/internal/startlinetest",
+	"internal/runtime/syscall/linux",
+	"internal/runtime/syscall/windows",
+	"internal/runtime/startlinetest",
+	"internal/runtime/maps",
 }
-
-var (
-	pkgSpecials     map[string]PkgSpecial
-	pkgSpecialsOnce sync.Once
-)
 
 // LookupPkgSpecial returns special build properties for the given package path.
 func LookupPkgSpecial(pkgPath string) PkgSpecial {
-	pkgSpecialsOnce.Do(func() {
-		// Construct pkgSpecials from various package lists. This lets us use
-		// more flexible logic, while keeping the final map simple, and avoids
-		// the init-time cost of a map.
-		pkgSpecials = make(map[string]PkgSpecial)
-		set := func(elt string, f func(*PkgSpecial)) {
-			s := pkgSpecials[elt]
-			f(&s)
-			pkgSpecials[elt] = s
-		}
-		for _, pkg := range runtimePkgs {
-			set(pkg, func(ps *PkgSpecial) { ps.Runtime = true; ps.NoInstrument = true })
-		}
-		for _, pkg := range extraNoInstrumentPkgs {
-			if pkg[0] == '-' {
-				set(pkg[1:], func(ps *PkgSpecial) { ps.NoInstrument = false })
-			} else {
-				set(pkg, func(ps *PkgSpecial) { ps.NoInstrument = true })
-			}
-		}
-		for _, pkg := range noRaceFuncPkgs {
-			set(pkg, func(ps *PkgSpecial) { ps.NoRaceFunc = true })
-		}
-		for _, pkg := range allowAsmABIPkgs {
-			set(pkg, func(ps *PkgSpecial) { ps.AllowAsmABI = true })
-		}
-	})
-	return pkgSpecials[pkgPath]
+	return pkgSpecialsOnce()[pkgPath]
 }
+
+var pkgSpecialsOnce = sync.OnceValue(func() map[string]PkgSpecial {
+	// Construct pkgSpecials from various package lists. This lets us use
+	// more flexible logic, while keeping the final map simple, and avoids
+	// the init-time cost of a map.
+	pkgSpecials := make(map[string]PkgSpecial)
+	set := func(elt string, f func(*PkgSpecial)) {
+		s := pkgSpecials[elt]
+		f(&s)
+		pkgSpecials[elt] = s
+	}
+	for _, pkg := range runtimePkgs {
+		set(pkg, func(ps *PkgSpecial) { ps.Runtime = true; ps.NoInstrument = true })
+	}
+	for _, pkg := range extraNoInstrumentPkgs {
+		if pkg[0] == '-' {
+			set(pkg[1:], func(ps *PkgSpecial) { ps.NoInstrument = false })
+		} else {
+			set(pkg, func(ps *PkgSpecial) { ps.NoInstrument = true })
+		}
+	}
+	for _, pkg := range noRaceFuncPkgs {
+		set(pkg, func(ps *PkgSpecial) { ps.NoRaceFunc = true })
+	}
+	for _, pkg := range allowAsmABIPkgs {
+		set(pkg, func(ps *PkgSpecial) { ps.AllowAsmABI = true })
+	}
+	return pkgSpecials
+})

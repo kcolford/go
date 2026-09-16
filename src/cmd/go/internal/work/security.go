@@ -61,6 +61,7 @@ var validCompilerFlags = []*lazyregexp.Regexp{
 	re(`-f(no-)?constant-cfstrings`),
 	re(`-fdebug-prefix-map=([^@]+)=([^@]+)`),
 	re(`-fdiagnostics-show-note-include-stack`),
+	re(`-fexcess-precision=([A-Za-z0-9_]+)`),
 	re(`-ffile-prefix-map=([^@]+)=([^@]+)`),
 	re(`-fno-canonical-system-headers`),
 	re(`-f(no-)?eliminate-unused-debug-types`),
@@ -90,22 +91,27 @@ var validCompilerFlags = []*lazyregexp.Regexp{
 	re(`-f(no-)?use-linker-plugin`), // safe if -B is not used; we don't permit -B
 	re(`-f(no-)?visibility-inlines-hidden`),
 	re(`-fsanitize=(.+)`),
+	re(`-fsanitize-undefined-strip-path-components=(-)?[0-9]+`),
 	re(`-ftemplate-depth-(.+)`),
+	re(`-ftls-model=(global-dynamic|local-dynamic|initial-exec|local-exec)`),
 	re(`-fvisibility=(.+)`),
 	re(`-g([^@\-].*)?`),
 	re(`-m32`),
 	re(`-m64`),
-	re(`-m(abi|arch|cpu|fpu|tune)=([^@\-].*)`),
+	re(`-m(abi|arch|cpu|fpu|simd|tls-dialect|tune)=([^@\-].*)`),
 	re(`-m(no-)?v?aes`),
 	re(`-marm`),
-	re(`-m(no-)?avx[0-9a-z]*`),
 	re(`-mcmodel=[0-9a-z-]+`),
 	re(`-mfloat-abi=([^@\-].*)`),
+	re(`-m(soft|single|double)-float`),
 	re(`-mfpmath=[0-9a-z,+]*`),
 	re(`-m(no-)?avx[0-9a-z.]*`),
 	re(`-m(no-)?ms-bitfields`),
 	re(`-m(no-)?stack-(.+)`),
 	re(`-mmacosx-(.+)`),
+	re(`-m(no-)?relax`),
+	re(`-m(no-)?strict-align`),
+	re(`-m(no-)?(lsx|lasx|frecipe|div32|lam-bh|lamcas|ld-seq-sa)`),
 	re(`-mios-simulator-version-min=(.+)`),
 	re(`-miphoneos-version-min=(.+)`),
 	re(`-mlarge-data-threshold=[0-9]+`),
@@ -124,6 +130,7 @@ var validCompilerFlags = []*lazyregexp.Regexp{
 	re(`-pedantic(-errors)?`),
 	re(`-pipe`),
 	re(`-pthread`),
+	re(`--static`),
 	re(`-?-std=([^@\-].*)`),
 	re(`-?-stdlib=([^@\-].*)`),
 	re(`--sysroot=([^@\-].*)`),
@@ -165,8 +172,13 @@ var validLinkerFlags = []*lazyregexp.Regexp{
 	re(`-flat_namespace`),
 	re(`-g([^@\-].*)?`),
 	re(`-headerpad_max_install_names`),
-	re(`-m(abi|arch|cpu|fpu|tune)=([^@\-].*)`),
+	re(`-m(abi|arch|cpu|fpu|simd|tls-dialect|tune)=([^@\-].*)`),
+	re(`-mcmodel=[0-9a-z-]+`),
 	re(`-mfloat-abi=([^@\-].*)`),
+	re(`-m(soft|single|double)-float`),
+	re(`-m(no-)?relax`),
+	re(`-m(no-)?strict-align`),
+	re(`-m(no-)?(lsx|lasx|frecipe|div32|lam-bh|lamcas|ld-seq-sa)`),
 	re(`-mmacosx-(.+)`),
 	re(`-mios-simulator-version-min=(.+)`),
 	re(`-miphoneos-version-min=(.+)`),
@@ -200,21 +212,23 @@ var validLinkerFlags = []*lazyregexp.Regexp{
 	re(`-Wl,--end-group`),
 	re(`-Wl,--(no-)?export-dynamic`),
 	re(`-Wl,-E`),
-	re(`-Wl,-framework,[^,@\-][^,]+`),
+	re(`-Wl,-framework,[^,@\-][^,]*`),
 	re(`-Wl,--hash-style=(sysv|gnu|both)`),
 	re(`-Wl,-headerpad_max_install_names`),
 	re(`-Wl,--no-undefined`),
+	re(`-Wl,--pop-state`),
+	re(`-Wl,--push-state`),
 	re(`-Wl,-R,?([^@\-,][^,@]*$)`),
-	re(`-Wl,--just-symbols[=,]([^,@\-][^,@]+)`),
-	re(`-Wl,-rpath(-link)?[=,]([^,@\-][^,]+)`),
+	re(`-Wl,--just-symbols[=,]([^,@\-][^,@]*)`),
+	re(`-Wl,-rpath(-link)?[=,]([^,@\-][^,]*)`),
 	re(`-Wl,-s`),
 	re(`-Wl,-search_paths_first`),
-	re(`-Wl,-sectcreate,([^,@\-][^,]+),([^,@\-][^,]+),([^,@\-][^,]+)`),
+	re(`-Wl,-sectcreate,([^,@\-][^,]*),([^,@\-][^,]*),([^,@\-][^,]*)`),
 	re(`-Wl,--start-group`),
 	re(`-Wl,-?-static`),
 	re(`-Wl,-?-subsystem,(native|windows|console|posix|xbox)`),
-	re(`-Wl,-syslibroot[=,]([^,@\-][^,]+)`),
-	re(`-Wl,-undefined[=,]([^,@\-][^,]+)`),
+	re(`-Wl,-syslibroot[=,]([^,@\-][^,]*)`),
+	re(`-Wl,-undefined[=,]([^,@\-][^,]*)`),
 	re(`-Wl,-?-unresolved-symbols=[^,]+`),
 	re(`-Wl,--(no-)?warn-([^,]+)`),
 	re(`-Wl,-?-wrap[=,][^,@\-][^,]*`),
@@ -240,6 +254,58 @@ var validLinkerFlagsWithNextArg = []string{
 	"-Wl,-undefined",
 }
 
+var validPkgConfigFlags = []*lazyregexp.Regexp{
+	re(`--atleast-pkgconfig-version=\d+\.\d+\.\d+`),
+	re(`--atleast-version=\d+\.\d+\.\d+`),
+	re(`--cflags-only-I`),
+	re(`--cflags`),
+	re(`--define-prefix`),
+	re(`--define-variable=[A-Za-z_][A-Za-z0-9_]*=[^@\-].*`),
+	re(`--digraph`),
+	re(`--dont-define-prefix`),
+	re(`--dont-relocate-paths`),
+	re(`--dump-personality`),
+	re(`--env-only`),
+	re(`--errors-to-stdout`),
+	re(`--exact-version=\d+\.\d+\.\d+`),
+	re(`--exists`),
+	re(`--fragment-filter=[A-Za-z_][a-zA-Z0-9_]*`),
+	re(`--ignore-conflicts`),
+	re(`--internal-cflags`),
+	re(`--keep-system-cflags`),
+	re(`--keep-system-libs`),
+	re(`--libs-only-l`),
+	re(`--libs-only-L`),
+	re(`--libs`),
+	re(`--list-all`),
+	re(`--list-package-names`),
+	re(`--max-version=\d+\.\d+\.\d+`),
+	re(`--maximum-traverse-depth=[0-9]+`),
+	re(`--modversion`),
+	re(`--msvc-syntax`),
+	re(`--no-cache`),
+	re(`--no-provides`),
+	re(`--no-uninstalled`),
+	re(`--path`),
+	re(`--personality=(triplet|filename)`),
+	re(`--prefix-variable=[A-Za-z_][a-zA-Z0-9_]*`),
+	re(`--print-errors`),
+	re(`--print-provides`),
+	re(`--print-requires-private`),
+	re(`--print-requires`),
+	re(`--print-variables`),
+	re(`--pure`),
+	re(`--shared`),
+	re(`--short-errors`),
+	re(`--silence-errors`),
+	re(`--simulate`),
+	re(`--static`),
+	re(`--uninstalled`),
+	re(`--validate`),
+	re(`--variable=[A-Za-z_][a-zA-Z0-9_]*`),
+	re(`--with-path=[^@\-].*`),
+}
+
 func checkCompilerFlags(name, source string, list []string) error {
 	checkOverrides := true
 	return checkFlags(name, source, list, nil, validCompilerFlags, validCompilerFlagsWithNextArg, checkOverrides)
@@ -248,6 +314,11 @@ func checkCompilerFlags(name, source string, list []string) error {
 func checkLinkerFlags(name, source string, list []string) error {
 	checkOverrides := true
 	return checkFlags(name, source, list, invalidLinkerFlags, validLinkerFlags, validLinkerFlagsWithNextArg, checkOverrides)
+}
+
+func checkPkgConfigFlags(name, source string, list []string) error {
+	checkOverrides := false
+	return checkFlags(name, source, list, nil, validPkgConfigFlags, nil, checkOverrides)
 }
 
 // checkCompilerFlagsForInternalLink returns an error if 'list'
@@ -261,8 +332,32 @@ func checkCompilerFlagsForInternalLink(name, source string, list []string) error
 	}
 	// Currently the only flag on the allow list that causes problems
 	// for the linker is "-flto"; check for it manually here.
+	// Also check for -static/--static, which some toolchains accept
+	// as a compiler flag.
 	for _, fl := range list {
 		if strings.HasPrefix(fl, "-flto") {
+			return fmt.Errorf("flag %q triggers external linking", fl)
+		}
+		if fl == "-static" || fl == "--static" {
+			return fmt.Errorf("flag %q triggers external linking", fl)
+		}
+	}
+	return nil
+}
+
+// checkLinkerFlagsForInternalLink returns an error if 'list'
+// contains linker flags that are not compatible with internal linking.
+func checkLinkerFlagsForInternalLink(name, source string, list []string) error {
+	checkOverrides := false
+	if err := checkFlags(name, source, list, nil, validLinkerFlags, validLinkerFlagsWithNextArg, checkOverrides); err != nil {
+		return err
+	}
+	// Flags that force static linking require the external linker
+	// to resolve libc symbols. See #77768.
+	for _, fl := range list {
+		if fl == "-static" || fl == "--static" ||
+			fl == "-Wl,-static" || fl == "-Wl,--static" ||
+			fl == "-Wl,-Bstatic" {
 			return fmt.Errorf("flag %q triggers external linking", fl)
 		}
 	}
@@ -307,7 +402,31 @@ Args:
 			}
 		}
 		for _, re := range valid {
-			if re.FindString(arg) == arg { // must be complete match
+			if match := re.FindString(arg); match == arg { // must be complete match
+				continue Args
+			} else if strings.HasPrefix(arg, "-Wl,--push-state,") {
+				// Examples for --push-state are written
+				//     -Wl,--push-state,--as-needed
+				// Support other commands in the same -Wl arg.
+				args := strings.Split(arg, ",")
+				for _, a := range args[1:] {
+					a = "-Wl," + a
+					var found bool
+					for _, re := range valid {
+						if re.FindString(a) == a {
+							found = true
+							break
+						}
+					}
+					if !found {
+						goto Bad
+					}
+					for _, re := range invalid {
+						if re.FindString(a) == a {
+							goto Bad
+						}
+					}
+				}
 				continue Args
 			}
 		}
@@ -338,13 +457,13 @@ Args:
 				}
 
 				if i+1 < len(list) {
-					return fmt.Errorf("invalid flag in %s: %s %s (see https://golang.org/s/invalidflag)", source, arg, list[i+1])
+					return fmt.Errorf("invalid flag in %s: %s %s (see https://go.dev/s/invalidflag)", source, arg, list[i+1])
 				}
-				return fmt.Errorf("invalid flag in %s: %s without argument (see https://golang.org/s/invalidflag)", source, arg)
+				return fmt.Errorf("invalid flag in %s: %s without argument (see https://go.dev/s/invalidflag)", source, arg)
 			}
 		}
 	Bad:
-		return fmt.Errorf("invalid flag in %s: %s", source, arg)
+		return fmt.Errorf("invalid flag in %s: %s (see https://go.dev/s/invalidflag)", source, arg)
 	}
 	return nil
 }

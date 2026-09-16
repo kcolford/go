@@ -41,7 +41,7 @@ const ranks = `
 # Sysmon
 NONE
 < sysmon
-< scavenge, forcegc;
+< scavenge, forcegc, computeMaxProcs, updateMaxProcsG;
 
 # Defer
 NONE < defer;
@@ -50,10 +50,15 @@ NONE < defer;
 NONE <
   sweepWaiters,
   assistQueue,
+  strongFromWeakQueue,
+  cleanupQueue,
   sweep;
 
 # Test only
 NONE < testR, testW;
+
+# vgetrandom
+NONE < vgetrandom;
 
 NONE < timerSend;
 
@@ -61,11 +66,15 @@ NONE < timerSend;
 NONE < allocmW, execW, cpuprof, pollCache, pollDesc, wakeableSleep;
 scavenge, sweep, testR, wakeableSleep, timerSend < hchan;
 assistQueue,
+  cleanupQueue,
+  computeMaxProcs,
   cpuprof,
   forcegc,
+  updateMaxProcsG,
   hchan,
   pollDesc, # pollDesc can interact with timers, which can lock sched.
   scavenge,
+  strongFromWeakQueue,
   sweep,
   sweepWaiters,
   testR,
@@ -93,6 +102,21 @@ NONE
 < itab
 < reflectOffs;
 
+# Typelinks
+NONE
+< typelinks;
+
+# Synctest
+hchan,
+  notifyList,
+  reflectOffs,
+  root,
+  strongFromWeakQueue,
+  sweepWaiters,
+  timer,
+  timers
+< synctest;
+
 # User arena state
 NONE < userArenaState;
 
@@ -118,7 +142,9 @@ allg,
   reflectOffs,
   timer,
   traceStrings,
-  userArenaState
+  typelinks,
+  userArenaState,
+  vgetrandom
 # Above MALLOC are things that can allocate memory.
 < MALLOC
 # Below MALLOC is the malloc implementation.
@@ -127,6 +153,11 @@ allg,
   mspanSpecial,
   traceTypeTab,
   MPROF;
+
+# Specials: we're allowed to allocate a special while holding
+# an mspanSpecial lock. Special record allocation can grow the stack,
+# so mheapSpecial must be above STACKGROW.
+mspanSpecial < mheapSpecial;
 
 # We can acquire gcBitsArenas for pinner bits, and
 # it's guarded by mspanSpecial.
@@ -138,11 +169,13 @@ profMemActive < profMemFuture;
 
 # Stack allocation and copying
 gcBitsArenas,
+  mheapSpecial,
   netpollInit,
   profBlock,
   profInsert,
   profMemFuture,
   spanSetSpine,
+  synctest,
   fin,
   root
 # Anything that can grow the stack can acquire STACKGROW.
@@ -171,6 +204,12 @@ defer,
 # Below WB is the write barrier implementation.
 < wbufSpans;
 
+# xRegState allocator
+sched < xRegAlloc;
+
+# spanSPMCs allocator and list
+WB, sched < spanSPMCs;
+
 # Span allocator
 stackLarge,
   stackpool,
@@ -178,12 +217,9 @@ stackLarge,
 # Above mheap is anything that can call the span allocator.
 < mheap;
 # Below mheap is the span allocator implementation.
-#
-# Specials: we're allowed to allocate a special while holding
-# an mspanSpecial lock, and they're part of the malloc implementation.
-# Pinner bits might be freed by the span allocator.
-mheap, mspanSpecial < mheapSpecial;
-mheap, mheapSpecial < globalAlloc;
+
+# Fixallocs
+mheap, mheapSpecial, xRegAlloc, spanSPMCs < globalAlloc;
 
 # Execution tracer events (with a P)
 hchan,
@@ -291,7 +327,7 @@ func generateGo(w io.Writer, g *dag.Graph) {
 
 package runtime
 
-type lockRank int
+type lockRank int64
 
 `)
 

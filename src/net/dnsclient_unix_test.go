@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -330,7 +331,7 @@ func (conf *resolvConfTest) write(lines []string) error {
 }
 
 func (conf *resolvConfTest) writeAndUpdate(lines []string) error {
-	return conf.writeAndUpdateWithLastCheckedTime(lines, time.Now().Add(time.Hour))
+	return conf.writeAndUpdateWithLastCheckedTime(lines, distantFuture)
 }
 
 func (conf *resolvConfTest) writeAndUpdateWithLastCheckedTime(lines []string, lastChecked time.Time) error {
@@ -429,7 +430,7 @@ func TestUpdateResolvConf(t *testing.T) {
 			wg.Wait()
 		}
 		servers := conf.servers()
-		if !reflect.DeepEqual(servers, tt.servers) {
+		if !slices.Equal(servers, tt.servers) {
 			t.Errorf("#%d: got %v; want %v", i, servers, tt.servers)
 			continue
 		}
@@ -696,6 +697,128 @@ func TestGoLookupIPOrderFallbackToFile(t *testing.T) {
 		}
 		if got, want := addrs[0].String(), "127.1.1.1"; got != want {
 			t.Errorf("%s: address doesn't match expectation. got %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestIsLocalhostName(t *testing.T) {
+	tests := []struct {
+		name      string
+		localhost bool
+	}{
+		{"localhost", true},
+		{"localhost.", true},
+		{"LOCALHOST", true},
+		{"LocalHost.", true},
+		{"foo.localhost", true},
+		{"foo.localhost.", true},
+		{"foo.LOCALHOST", true},
+		{"a.b.localhost", true},
+
+		{"", false},
+		{".", false},
+		{"localhost.localdomain", false},
+		{"localhost1", false},
+		{"1localhost", false},
+		{"notlocalhost", false},
+		{"localhost.com", false},
+		{"foo.local", false},
+		{"foo.com", false},
+	}
+	for _, tt := range tests {
+		if got := isLocalhostName(tt.name); got != tt.localhost {
+			t.Errorf("isLocalhostName(%q) = %v; want %v", tt.name, got, tt.localhost)
+		}
+	}
+}
+
+// Localhost names always mean loopback, are answered without DNS, and
+// are never expanded with search domains (RFC 6761, section 6.3).
+// This must hold even with no localhost entries in the hosts file,
+// which is how Windows ships its hosts file. See go.dev/issue/57757.
+func TestGoLookupLocalhost(t *testing.T) {
+	defer dnsWaitGroup.Wait()
+
+	// Any DNS query at all is a failure: with the search domain below
+	// and default ndots, a leak would look like a query for
+	// "localhost.example.com.".
+	fake := fakeDNSServer{rh: func(_, _ string, q dnsmessage.Message, _ time.Time) (dnsmessage.Message, error) {
+		t.Errorf("unexpected DNS query for %v", q.Questions[0].Name)
+		return dnsmessage.Message{
+			Header:    dnsmessage.Header{ID: q.ID, Response: true, RCode: dnsmessage.RCodeNameError},
+			Questions: q.Questions,
+		}, nil
+	}}
+	r := Resolver{PreferGo: true, Dial: fake.DialContext}
+
+	conf, err := newResolvConfTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conf.teardown()
+	if err := conf.writeAndUpdate([]string{"nameserver 8.8.8.8", "search example.com"}); err != nil {
+		t.Fatal(err)
+	}
+
+	defer func(orig string) { hostsFilePath = orig }(hostsFilePath)
+	hostsFilePath = "testdata/hosts-does-not-exist"
+
+	tests := []struct {
+		name    string
+		network string
+		want    []string
+	}{
+		{"localhost", "ip", []string{"127.0.0.1", "::1"}},
+		{"localhost.", "ip", []string{"127.0.0.1", "::1"}},
+		{"LocalHost", "ip", []string{"127.0.0.1", "::1"}},
+		{"foo.localhost", "ip", []string{"127.0.0.1", "::1"}},
+		{"foo.LOCALHOST.", "ip", []string{"127.0.0.1", "::1"}},
+		{"localhost", "ip4", []string{"127.0.0.1"}},
+		{"localhost", "ip6", []string{"::1"}},
+	}
+	orders := []hostLookupOrder{hostLookupFilesDNS, hostLookupDNSFiles, hostLookupFiles, hostLookupDNS}
+	for _, order := range orders {
+		for _, tt := range tests {
+			addrs, _, err := r.goLookupIPCNAMEOrder(context.Background(), tt.network, tt.name, order, nil)
+			if err != nil {
+				t.Errorf("order %v: lookup of %q (%v): %v", order, tt.name, tt.network, err)
+				continue
+			}
+			got := make([]string, len(addrs))
+			for i, a := range addrs {
+				got[i] = a.String()
+			}
+			slices.Sort(got)
+			want := slices.Clone(tt.want)
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Errorf("order %v: lookup of %q (%v) = %v; want %v", order, tt.name, tt.network, got, want)
+			}
+		}
+	}
+
+	// Non-address queries for localhost names get negative responses,
+	// again without any DNS query.
+	for _, qtype := range []dnsmessage.Type{dnsmessage.TypeMX, dnsmessage.TypeTXT, dnsmessage.TypeSRV, dnsmessage.TypeNS} {
+		for _, name := range []string{"localhost", "foo.localhost"} {
+			_, _, err := r.lookup(context.Background(), name, qtype, nil)
+			var dnsErr *DNSError
+			if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+				t.Errorf("lookup of %q (%v) = %v; want a not-found DNSError", name, qtype, err)
+			}
+		}
+	}
+
+	// An explicit hosts file entry for localhost overrides the builtin
+	// answer for orders that consult files before DNS.
+	hostsFilePath = "testdata/hosts" // contains "fe80::1%lo0 localhost"
+	for _, order := range []hostLookupOrder{hostLookupFilesDNS, hostLookupFiles} {
+		addrs, _, err := r.goLookupIPCNAMEOrder(context.Background(), "ip", "localhost", order, nil)
+		if err != nil {
+			t.Fatalf("order %v: lookup of localhost with hosts entry: %v", order, err)
+		}
+		if len(addrs) != 1 || addrs[0].String() != "fe80::1%lo0" {
+			t.Errorf("order %v: lookup of localhost with hosts entry = %v; want [fe80::1%%lo0]", order, addrs)
 		}
 	}
 }
@@ -1154,7 +1277,7 @@ func testRotate(t *testing.T, rotate bool, nameservers, wantServers []string) {
 		}
 	}
 
-	if !reflect.DeepEqual(usedServers, wantServers) {
+	if !slices.Equal(usedServers, wantServers) {
 		t.Errorf("rotate=%t got used servers:\n%v\nwant:\n%v", rotate, usedServers, wantServers)
 	}
 }
@@ -1433,7 +1556,7 @@ func TestStrictErrorsLookupIP(t *testing.T) {
 					wantIPs[ip] = struct{}{}
 				}
 			}
-			if !reflect.DeepEqual(gotIPs, wantIPs) {
+			if !maps.Equal(gotIPs, wantIPs) {
 				t.Errorf("#%d (%s) strict=%v: got ips %v; want %v", i, tt.desc, strict, gotIPs, wantIPs)
 			}
 		}
@@ -1940,7 +2063,7 @@ func TestPTRandNonPTR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupAddr: %v", err)
 	}
-	if want := []string{"golang.org."}; !reflect.DeepEqual(names, want) {
+	if want := []string{"golang.org."}; !slices.Equal(names, want) {
 		t.Errorf("names = %q; want %q", names, want)
 	}
 }
@@ -2025,6 +2148,50 @@ func TestCVE202133195(t *testing.T) {
 						},
 						Body: &dnsmessage.MXResource{
 							MX: dnsmessage.MustNewName("good.golang.org."),
+						},
+					},
+					dnsmessage.Resource{
+						Header: dnsmessage.ResourceHeader{
+							Name:   dnsmessage.MustNewName("127.0.0.1."),
+							Type:   dnsmessage.TypeMX,
+							Class:  dnsmessage.ClassINET,
+							Length: 4,
+						},
+						Body: &dnsmessage.MXResource{
+							MX: dnsmessage.MustNewName("127.0.0.1."),
+						},
+					},
+					dnsmessage.Resource{
+						Header: dnsmessage.ResourceHeader{
+							Name:   dnsmessage.MustNewName("1.2.3.4.5."),
+							Type:   dnsmessage.TypeMX,
+							Class:  dnsmessage.ClassINET,
+							Length: 4,
+						},
+						Body: &dnsmessage.MXResource{
+							MX: dnsmessage.MustNewName("1.2.3.4.5."),
+						},
+					},
+					dnsmessage.Resource{
+						Header: dnsmessage.ResourceHeader{
+							Name:   dnsmessage.MustNewName("2001:4860:0:2001::68."),
+							Type:   dnsmessage.TypeMX,
+							Class:  dnsmessage.ClassINET,
+							Length: 4,
+						},
+						Body: &dnsmessage.MXResource{
+							MX: dnsmessage.MustNewName("2001:4860:0:2001::68."),
+						},
+					},
+					dnsmessage.Resource{
+						Header: dnsmessage.ResourceHeader{
+							Name:   dnsmessage.MustNewName("2001:4860:0:2001::68%zone."),
+							Type:   dnsmessage.TypeMX,
+							Class:  dnsmessage.ClassINET,
+							Length: 4,
+						},
+						Body: &dnsmessage.MXResource{
+							MX: dnsmessage.MustNewName("2001:4860:0:2001::68%zone."),
 						},
 					},
 				)
@@ -2151,25 +2318,37 @@ func TestCVE202133195(t *testing.T) {
 		{
 			name: "MX",
 			f: func(t *testing.T) {
-				expected := []*MX{
-					{
-						Host: "good.golang.org.",
-					},
+				expected := []string{
+					"127.0.0.1.",
+					"2001:4860:0:2001::68.",
+					"good.golang.org.",
 				}
 				expectedErr := &DNSError{Err: errMalformedDNSRecordsDetail, Name: "golang.org"}
 				records, err := r.LookupMX(context.Background(), "golang.org")
 				if err.Error() != expectedErr.Error() {
 					t.Fatalf("unexpected error: %s", err)
 				}
-				if !reflect.DeepEqual(records, expected) {
-					t.Error("Unexpected record set")
+
+				hosts := func(records []*MX) []string {
+					var got []string
+					for _, mx := range records {
+						got = append(got, mx.Host)
+					}
+					slices.Sort(got)
+					return got
+				}
+
+				got := hosts(records)
+				if !slices.Equal(got, expected) {
+					t.Errorf("Unexpected record set: got %v, want %v", got, expected)
 				}
 				records, err = LookupMX("golang.org")
 				if err.Error() != expectedErr.Error() {
 					t.Fatalf("unexpected error: %s", err)
 				}
-				if !reflect.DeepEqual(records, expected) {
-					t.Error("Unexpected record set")
+				got = hosts(records)
+				if !slices.Equal(got, expected) {
+					t.Errorf("Unexpected record set: got %v, want %v", got, expected)
 				}
 			},
 		},
@@ -2207,14 +2386,14 @@ func TestCVE202133195(t *testing.T) {
 				if err.Error() != expectedErr.Error() {
 					t.Fatalf("unexpected error: %s", err)
 				}
-				if !reflect.DeepEqual(records, expected) {
+				if !slices.Equal(records, expected) {
 					t.Error("Unexpected record set")
 				}
 				records, err = LookupAddr("192.0.2.42")
 				if err.Error() != expectedErr.Error() {
 					t.Fatalf("unexpected error: %s", err)
 				}
-				if !reflect.DeepEqual(records, expected) {
+				if !slices.Equal(records, expected) {
 					t.Error("Unexpected record set")
 				}
 			},
@@ -2570,8 +2749,7 @@ func TestLongDNSNames(t *testing.T) {
 				}
 
 				expectedErr := DNSError{Err: errNoSuchHost.Error(), Name: v.req, IsNotFound: true}
-				var dnsErr *DNSError
-				errors.As(err, &dnsErr)
+				dnsErr, _ := errors.AsType[*DNSError](err)
 				if dnsErr == nil || *dnsErr != expectedErr {
 					t.Errorf("%v: Lookup%v: unexpected error: %v", i, testName, err)
 				}
@@ -2763,8 +2941,7 @@ func TestLookupOrderFilesNoSuchHost(t *testing.T) {
 		}
 
 		expectedErr := DNSError{Err: errNoSuchHost.Error(), Name: testName, IsNotFound: true}
-		var dnsErr *DNSError
-		errors.As(err, &dnsErr)
+		dnsErr, _ := errors.AsType[*DNSError](err)
 		if dnsErr == nil || *dnsErr != expectedErr {
 			t.Errorf("Lookup%v: unexpected error: %v", v.name, err)
 		}
@@ -2796,8 +2973,33 @@ func TestExtendedRCode(t *testing.T) {
 
 	r := &Resolver{PreferGo: true, Dial: fake.DialContext}
 	_, _, err := r.tryOneName(context.Background(), getSystemDNSConfig(), "go.dev.", dnsmessage.TypeA)
-	var dnsErr *DNSError
-	if !(errors.As(err, &dnsErr) && dnsErr.Err == errServerMisbehaving.Error()) {
+	if dnsErr, ok := errors.AsType[*DNSError](err); !ok || dnsErr.Err != errServerMisbehaving.Error() {
 		t.Fatalf("r.tryOneName(): unexpected error: %v", err)
+	}
+}
+
+// This test makes sure that we always re-check the resolv.conf no matter
+// the elapsed time in case the default nameservers are used.
+func TestEmptyResolvConfReplacedWithConfHaingNameservers(t *testing.T) {
+	conf, err := newResolvConfTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conf.teardown()
+
+	if err := conf.writeAndUpdateWithLastCheckedTime([]string{"# empty resolv.conf file"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !getSystemDNSConfigNamed(conf.path).isDefaultNS() {
+		t.Fatal("resolv.conf was not re-loaded")
+	}
+
+	if err := conf.writeAndUpdateWithLastCheckedTime([]string{"nameserver 192.0.2.1"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if getSystemDNSConfigNamed(conf.path).isDefaultNS() {
+		t.Fatal("resolv.conf was not re-loaded")
 	}
 }

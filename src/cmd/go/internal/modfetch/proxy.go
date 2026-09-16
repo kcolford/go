@@ -12,7 +12,6 @@ import (
 	"io"
 	"io/fs"
 	"net/url"
-	"path"
 	pathpkg "path"
 	"path/filepath"
 	"strings"
@@ -38,7 +37,7 @@ a site serving from a fixed file system (including a file:/// URL)
 can be a module proxy.
 
 For details on the GOPROXY protocol, see
-https://golang.org/ref/mod#goproxy-protocol.
+https://go.dev/ref/mod#goproxy-protocol.
 `,
 }
 
@@ -98,7 +97,7 @@ func proxyList() ([]proxySpec, error) {
 			// Single-word tokens are reserved for built-in behaviors, and anything
 			// containing the string ":/" or matching an absolute file path must be a
 			// complete URL. For all other paths, implicitly add "https://".
-			if strings.ContainsAny(url, ".:/") && !strings.Contains(url, ":/") && !filepath.IsAbs(url) && !path.IsAbs(url) {
+			if strings.ContainsAny(url, ".:/") && !strings.Contains(url, ":/") && !filepath.IsAbs(url) && !pathpkg.IsAbs(url) {
 				url = "https://" + url
 			}
 
@@ -239,13 +238,17 @@ func (p *proxyRepo) CheckReuse(ctx context.Context, old *codehost.Origin) error 
 // versionError returns err wrapped in a ModuleError for p.path.
 func (p *proxyRepo) versionError(version string, err error) error {
 	if version != "" && version != module.CanonicalVersion(version) {
-		return &module.ModuleError{
-			Path: p.path,
-			Err: &module.InvalidVersionError{
+		var iv *module.InvalidVersionError
+		if !errors.As(err, &iv) {
+			iv = &module.InvalidVersionError{
 				Version: version,
 				Pseudo:  module.IsPseudoVersion(version),
 				Err:     err,
-			},
+			}
+		}
+		return &module.ModuleError{
+			Path: p.path,
+			Err:  iv,
 		}
 	}
 

@@ -62,7 +62,6 @@ func TestMSAN(t *testing.T) {
 		{src: "arena_fail.go", wantErr: true, experiments: []string{"arenas"}},
 	}
 	for _, tc := range cases {
-		tc := tc
 		name := strings.TrimSuffix(tc.src, ".go")
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -79,7 +78,7 @@ func TestMSAN(t *testing.T) {
 				if err != nil {
 					return
 				}
-				t.Fatalf("%#q exited without error; want MSAN failure\n%s", strings.Join(cmd.Args, " "), out)
+				t.Fatalf("%#q exited without error; want MSAN failure\n%s", cmd, out)
 			}
 			mustRun(t, cmd)
 		})

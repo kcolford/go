@@ -64,7 +64,7 @@ func TestChown(t *testing.T) {
 	// Then try all the auxiliary groups.
 	groups, err := Getgroups()
 	if err != nil {
-		t.Fatalf("getgroups: %s", err)
+		t.Fatal(err)
 	}
 	t.Log("groups: ", groups)
 	for _, g := range groups {
@@ -112,7 +112,7 @@ func TestFileChown(t *testing.T) {
 	// Then try all the auxiliary groups.
 	groups, err := Getgroups()
 	if err != nil {
-		t.Fatalf("getgroups: %s", err)
+		t.Fatal(err)
 	}
 	t.Log("groups: ", groups)
 	for _, g := range groups {
@@ -170,7 +170,7 @@ func TestLchown(t *testing.T) {
 	// Then try all the auxiliary groups.
 	groups, err := Getgroups()
 	if err != nil {
-		t.Fatalf("getgroups: %s", err)
+		t.Fatal(err)
 	}
 	t.Log("groups: ", groups)
 	for _, g := range groups {
@@ -196,15 +196,13 @@ func TestLchown(t *testing.T) {
 
 // Issue 16919: Readdir must return a non-empty slice or an error.
 func TestReaddirRemoveRace(t *testing.T) {
-	oldStat := *LstatP
-	defer func() { *LstatP = oldStat }()
-	*LstatP = func(name string) (FileInfo, error) {
+	SetStatHook(t, func(f *File, name string) (FileInfo, error) {
 		if strings.HasSuffix(name, "some-file") {
 			// Act like it's been deleted.
 			return nil, ErrNotExist
 		}
-		return oldStat(name)
-	}
+		return nil, nil
+	})
 	dir := t.TempDir()
 	if err := WriteFile(filepath.Join(dir, "some-file"), []byte("hello"), 0644); err != nil {
 		t.Fatal(err)
@@ -233,7 +231,9 @@ func TestMkdirStickyUmask(t *testing.T) {
 	if runtime.GOOS == "wasip1" {
 		t.Skip("file permissions not supported on " + runtime.GOOS)
 	}
-	t.Parallel()
+	// Issue #69788: This test temporarily changes the umask for testing purposes,
+	// so it shouldn't be run in parallel with other test cases
+	// to avoid other tests (e.g., TestCopyFS) creating files with an unintended umask.
 
 	const umask = 0077
 	dir := t.TempDir()
@@ -372,7 +372,7 @@ func TestSplitPath(t *testing.T) {
 //
 // Regression test for go.dev/issue/60181
 func TestIssue60181(t *testing.T) {
-	defer chtmpdir(t)()
+	t.Chdir(t.TempDir())
 
 	want := "hello gopher"
 

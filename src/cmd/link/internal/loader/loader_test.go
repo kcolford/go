@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-// dummyAddSym adds the named symbol to the loader as if it had been
+// addDummyObjSym adds the named symbol to the loader as if it had been
 // read from a Go object file. Note that it allocates a global
 // index without creating an associated object reader, so one can't
 // do anything interesting with this symbol (such as look at its
@@ -355,7 +355,7 @@ func TestAddDataMethods(t *testing.T) {
 		name := fmt.Sprintf("new%d", k+1)
 		mi := ldr.LookupOrCreateSym(name, 0)
 		if mi == 0 {
-			t.Fatalf("LookupOrCreateSym failed for '" + name + "'")
+			t.Fatalf("LookupOrCreateSym failed for %q", name)
 		}
 		mi = tp.addDataFunc(ldr, mi, pmi)
 		if ldr.SymType(mi) != tp.expKind {

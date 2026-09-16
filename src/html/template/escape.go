@@ -10,6 +10,7 @@ import (
 	"html"
 	"internal/godebug"
 	"io"
+	"maps"
 	"regexp"
 	"text/template"
 	"text/template/parse"
@@ -145,7 +146,7 @@ func (e *escaper) escape(c context, n parse.Node) context {
 		return c
 	case *parse.ContinueNode:
 		c.n = n
-		e.rangeContext.continues = append(e.rangeContext.breaks, c)
+		e.rangeContext.continues = append(e.rangeContext.continues, c)
 		return context{state: stateDead}
 	case *parse.IfNode:
 		return e.escapeBranch(c, &n.BranchNode, "if")
@@ -164,6 +165,8 @@ func (e *escaper) escape(c context, n parse.Node) context {
 }
 
 var debugAllowActionJSTmpl = godebug.New("jstmpllitinterp")
+
+var htmlmetacontenturlescape = godebug.New("htmlmetacontenturlescape")
 
 // escapeAction escapes an action template node.
 func (e *escaper) escapeAction(c context, n *parse.ActionNode) context {
@@ -221,6 +224,18 @@ func (e *escaper) escapeAction(c context, n *parse.ActionNode) context {
 			}
 		default:
 			panic(c.urlPart.String())
+		}
+	case stateMetaContent:
+		// Handled below in delim check.
+	case stateMetaContentURL:
+		if htmlmetacontenturlescape.Value() != "0" {
+			s = append(s, "_html_template_urlfilter")
+		} else {
+			// We don't have a great place to increment this, since it's hard to
+			// know if we actually escape any urls in _html_template_urlfilter,
+			// since it has no information about what context it is being
+			// executed in etc. This is probably the best we can do.
+			htmlmetacontenturlescape.IncNonDefault()
 		}
 	case stateJS:
 		s = append(s, "_html_template_jsvalescaper")
@@ -508,7 +523,7 @@ func (e *escaper) escapeBranch(c context, n *parse.BranchNode, nodeName string) 
 	if nodeName == "range" {
 		e.rangeContext = &rangeContext{outer: e.rangeContext}
 	}
-	c0 := e.escapeList(c, n.List)
+	c0 := e.escapeList(c.clone(), n.List)
 	if nodeName == "range" {
 		if c0.state != stateError {
 			c0 = joinRange(c0, e.rangeContext)
@@ -539,7 +554,7 @@ func (e *escaper) escapeBranch(c context, n *parse.BranchNode, nodeName string) 
 			return c0
 		}
 	}
-	c1 := e.escapeList(c, n.ElseList)
+	c1 := e.escapeList(c.clone(), n.ElseList)
 	return join(c0, c1, n, nodeName)
 }
 
@@ -588,22 +603,14 @@ func (e *escaper) escapeListConditionally(c context, n *parse.ListNode, filter f
 	e1 := makeEscaper(e.ns)
 	e1.rangeContext = e.rangeContext
 	// Make type inferences available to f.
-	for k, v := range e.output {
-		e1.output[k] = v
-	}
+	maps.Copy(e1.output, e.output)
 	c = e1.escapeList(c, n)
 	ok := filter != nil && filter(&e1, c)
 	if ok {
 		// Copy inferences and edits from e1 back into e.
-		for k, v := range e1.output {
-			e.output[k] = v
-		}
-		for k, v := range e1.derived {
-			e.derived[k] = v
-		}
-		for k, v := range e1.called {
-			e.called[k] = v
-		}
+		maps.Copy(e.output, e1.output)
+		maps.Copy(e.derived, e1.derived)
+		maps.Copy(e.called, e1.called)
 		for k, v := range e1.actionNodeEdits {
 			e.editActionNode(k, v)
 		}

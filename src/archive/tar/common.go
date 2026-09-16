@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"internal/godebug"
 	"io/fs"
+	"maps"
 	"math"
 	"path"
 	"reflect"
@@ -38,6 +39,7 @@ var (
 	errMissData        = errors.New("archive/tar: sparse file references non-existent data")
 	errUnrefData       = errors.New("archive/tar: sparse file contains unreferenced data")
 	errWriteHole       = errors.New("archive/tar: write non-NUL byte in sparse hole")
+	errSparseTooLong   = errors.New("archive/tar: sparse map too long")
 )
 
 type headerError []string
@@ -696,24 +698,14 @@ func FileInfoHeader(fi fs.FileInfo, link string) (*Header, error) {
 		h.Gname = sys.Gname
 		h.AccessTime = sys.AccessTime
 		h.ChangeTime = sys.ChangeTime
-		if sys.Xattrs != nil {
-			h.Xattrs = make(map[string]string)
-			for k, v := range sys.Xattrs {
-				h.Xattrs[k] = v
-			}
-		}
+		h.Xattrs = maps.Clone(sys.Xattrs)
 		if sys.Typeflag == TypeLink {
 			// hard link
 			h.Typeflag = TypeLink
 			h.Size = 0
 			h.Linkname = sys.Linkname
 		}
-		if sys.PAXRecords != nil {
-			h.PAXRecords = make(map[string]string)
-			for k, v := range sys.PAXRecords {
-				h.PAXRecords[k] = v
-			}
-		}
+		h.PAXRecords = maps.Clone(sys.PAXRecords)
 	}
 	var doNameLookups = true
 	if iface, ok := fi.(FileInfoNames); ok {

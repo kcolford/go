@@ -61,7 +61,11 @@ func (l Level) String() string {
 		if val == 0 {
 			return base
 		}
-		return fmt.Sprintf("%s%+d", base, val)
+		sval := strconv.Itoa(int(val))
+		if val > 0 {
+			sval = "+" + sval
+		}
+		return base + sval
 	}
 
 	switch {
@@ -98,10 +102,16 @@ func (l *Level) UnmarshalJSON(data []byte) error {
 	return l.parse(s)
 }
 
-// MarshalText implements [encoding.TextMarshaler]
+// AppendText implements [encoding.TextAppender]
 // by calling [Level.String].
+func (l Level) AppendText(b []byte) ([]byte, error) {
+	return append(b, l.String()...), nil
+}
+
+// MarshalText implements [encoding.TextMarshaler]
+// by calling [Level.AppendText].
 func (l Level) MarshalText() ([]byte, error) {
-	return []byte(l.String()), nil
+	return l.AppendText(nil)
 }
 
 // UnmarshalText implements [encoding.TextUnmarshaler].
@@ -172,10 +182,16 @@ func (v *LevelVar) String() string {
 	return fmt.Sprintf("LevelVar(%s)", v.Level())
 }
 
+// AppendText implements [encoding.TextAppender]
+// by calling [Level.AppendText].
+func (v *LevelVar) AppendText(b []byte) ([]byte, error) {
+	return v.Level().AppendText(b)
+}
+
 // MarshalText implements [encoding.TextMarshaler]
-// by calling [Level.MarshalText].
+// by calling [LevelVar.AppendText].
 func (v *LevelVar) MarshalText() ([]byte, error) {
-	return v.Level().MarshalText()
+	return v.AppendText(nil)
 }
 
 // UnmarshalText implements [encoding.TextUnmarshaler]

@@ -57,7 +57,7 @@ func (s *StdSizes) Alignof(T Type) (result int64) {
 
 	// For arrays and structs, alignment is defined in terms
 	// of alignment of the elements and fields, respectively.
-	switch t := under(T).(type) {
+	switch t := T.Underlying().(type) {
 	case *Array:
 		// spec: "For a variable x of array type: unsafe.Alignof(x)
 		// is the same as unsafe.Alignof(x[0]), but at least 1."
@@ -72,6 +72,16 @@ func (s *StdSizes) Alignof(T Type) (result int64) {
 			// This logic is equivalent to the logic in
 			// cmd/compile/internal/types/size.go:calcStructOffset
 			return 8
+		}
+		if len(t.fields) == 0 && _IsSyncAtomicAlign128(T) {
+			// Special case: sync/atomic.align128 is an
+			// empty struct we recognize as a signal that
+			// the struct it contains must be
+			// 128-bit-aligned.
+			//
+			// This logic is equivalent to the logic in
+			// cmd/compile/internal/types/size.go:calcStructOffset
+			return 16
 		}
 
 		// spec: "For a variable x of struct type: unsafe.Alignof(x)
@@ -126,6 +136,18 @@ func _IsSyncAtomicAlign64(T Type) bool {
 			obj.Pkg().Path() == "internal/runtime/atomic")
 }
 
+func _IsSyncAtomicAlign128(T Type) bool {
+	named := asNamed(T)
+	if named == nil {
+		return false
+	}
+	obj := named.Obj()
+	return obj.Name() == "align128" &&
+		obj.Pkg() != nil &&
+		(obj.Pkg().Path() == "sync/atomic" ||
+			obj.Pkg().Path() == "internal/runtime/atomic")
+}
+
 func (s *StdSizes) Offsetsof(fields []*Var) []int64 {
 	offsets := make([]int64, len(fields))
 	var offs int64
@@ -165,7 +187,7 @@ var basicSizes = [...]byte{
 }
 
 func (s *StdSizes) Sizeof(T Type) int64 {
-	switch t := under(T).(type) {
+	switch t := T.Underlying().(type) {
 	case *Basic:
 		assert(isTyped(T))
 		k := t.kind
@@ -310,7 +332,7 @@ func (conf *Config) offsetsof(T *Struct) []int64 {
 func (conf *Config) offsetof(T Type, index []int) int64 {
 	var offs int64
 	for _, i := range index {
-		s := under(T).(*Struct)
+		s := T.Underlying().(*Struct)
 		d := conf.offsetsof(s)[i]
 		if d < 0 {
 			return -1
@@ -335,9 +357,9 @@ func (conf *Config) sizeof(T Type) int64 {
 }
 
 // align returns the smallest y >= x such that y % a == 0.
-// a must be within 1 and 8 and it must be a power of 2.
+// a must be within 1 and 16 and it must be a power of 2.
 // The result may be negative due to overflow.
 func align(x, a int64) int64 {
-	assert(x >= 0 && 1 <= a && a <= 8 && a&(a-1) == 0)
+	assert(x >= 0 && 1 <= a && a <= 16 && a&(a-1) == 0)
 	return (x + a - 1) &^ (a - 1)
 }

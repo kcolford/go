@@ -6,6 +6,11 @@ package runtime_test
 
 import (
 	"fmt"
+	"internal/abi"
+	"internal/asan"
+	"internal/msan"
+	"internal/race"
+	"internal/testenv"
 	"math/bits"
 	"math/rand"
 	"os"
@@ -19,6 +24,7 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+	"weak"
 )
 
 func TestGcSys(t *testing.T) {
@@ -196,6 +202,9 @@ func TestPeriodicGC(t *testing.T) {
 }
 
 func TestGcZombieReporting(t *testing.T) {
+	if asan.Enabled || msan.Enabled || race.Enabled {
+		t.Skip("skipped test: checkptr mode catches the issue before getting to zombie reporting")
+	}
 	// This test is somewhat sensitive to how the allocator works.
 	// Pointers in zombies slice may cross-span, thus we
 	// add invalidptr=0 for avoiding the badPointer check.
@@ -208,6 +217,9 @@ func TestGcZombieReporting(t *testing.T) {
 }
 
 func TestGCTestMoveStackOnNextCall(t *testing.T) {
+	if asan.Enabled {
+		t.Skip("extra allocations with -asan causes this to fail; see #70079")
+	}
 	t.Parallel()
 	var onStack int
 	// GCTestMoveStackOnNextCall can fail in rare cases if there's
@@ -298,6 +310,9 @@ var pointerClassBSS *int
 var pointerClassData = 42
 
 func TestGCTestPointerClass(t *testing.T) {
+	if asan.Enabled {
+		t.Skip("extra allocations cause this test to fail; see #70079")
+	}
 	t.Parallel()
 	check := func(p unsafe.Pointer, want string) {
 		t.Helper()
@@ -734,7 +749,7 @@ func BenchmarkMSpanCountAlloc(b *testing.B) {
 	// always rounded up 8 bytes.
 	for _, n := range []int{8, 16, 32, 64, 128} {
 		b.Run(fmt.Sprintf("bits=%d", n*8), func(b *testing.B) {
-			// Initialize a new byte slice with pseduo-random data.
+			// Initialize a new byte slice with pseudo-random data.
 			bits := make([]byte, n)
 			rand.Read(bits)
 
@@ -786,4 +801,127 @@ func TestMemoryLimitNoGCPercent(t *testing.T) {
 
 func TestMyGenericFunc(t *testing.T) {
 	runtime.MyGenericFunc[int]()
+}
+
+func TestWeakToStrongMarkTermination(t *testing.T) {
+	testenv.MustHaveParallelism(t)
+
+	type T struct {
+		a *int
+		b int
+	}
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(2))
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	w := make([]weak.Pointer[T], 2048)
+
+	// Make sure there's no out-standing GC from a previous test.
+	runtime.GC()
+
+	// Create many objects with a weak pointers to them.
+	for i := range w {
+		x := new(T)
+		x.a = new(int)
+		w[i] = weak.Make(x)
+	}
+
+	// Reset the restart flag.
+	runtime.GCMarkDoneResetRestartFlag()
+
+	// Prevent mark termination from completing.
+	runtime.SetSpinInGCMarkDone(true)
+
+	// Start a GC, and wait a little bit to get something spinning in mark termination.
+	// Simultaneously, fire off another goroutine to disable spinning. If everything's
+	// working correctly, then weak.Value will block, so we need to make sure something
+	// prevents the GC from continuing to spin.
+	done := make(chan struct{})
+	go func() {
+		runtime.GC()
+		done <- struct{}{}
+	}()
+	go func() {
+		// Usleep here instead of time.Sleep. time.Sleep
+		// can allocate, and if we get unlucky, then it
+		// can end up stuck in gcMarkDone with nothing to
+		// wake it.
+		runtime.Usleep(100000) // 100ms
+
+		// Let mark termination continue.
+		runtime.SetSpinInGCMarkDone(false)
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// Perform many weak->strong conversions in the critical window.
+	var wg sync.WaitGroup
+	for _, wp := range w {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wp.Value()
+		}()
+	}
+
+	// Make sure the GC completes.
+	<-done
+
+	// Make sure all the weak->strong conversions finish.
+	wg.Wait()
+
+	// The bug is triggered if there's still mark work after gcMarkDone stops the world.
+	//
+	// This can manifest in one of two ways today:
+	// - An exceedingly rare crash in mark termination.
+	// - gcMarkDone restarts, as if issue #27993 is at play.
+	//
+	// Check for the latter. This is a fairly controlled environment, so #27993 is very
+	// unlikely to happen (it's already rare to begin with) but we'll always _appear_ to
+	// trigger the same bug if weak->strong conversions aren't properly coordinated with
+	// mark termination.
+	if runtime.GCMarkDoneRestarted() {
+		t.Errorf("gcMarkDone restarted")
+	}
+}
+
+func TestDetectFinalizerAndCleanupLeaks(t *testing.T) {
+	got := runTestProg(t, "testprog", "DetectFinalizerAndCleanupLeaks", "GODEBUG=checkfinalizers=1")
+	sp := strings.SplitN(got, "detected possible issues with cleanups and/or finalizers", 2)
+	if len(sp) != 2 {
+		t.Fatalf("expected the runtime to throw, got:\n%s", got)
+	}
+	if strings.Count(sp[0], "is reachable from") != 2 {
+		t.Fatalf("expected exactly two leaked cleanups and/or finalizers, got:\n%s", got)
+	}
+	// N.B. Disable in race mode and in asan mode. Both disable the tiny allocator.
+	wantSymbolizedLocations := 2
+	if !race.Enabled && !asan.Enabled {
+		if strings.Count(sp[0], "is in a tiny block") != 1 {
+			t.Fatalf("expected exactly one report for allocation in a tiny block, got:\n%s", got)
+		}
+		wantSymbolizedLocations++
+	}
+	if strings.Count(sp[0], "main.DetectFinalizerAndCleanupLeaks()") != wantSymbolizedLocations {
+		t.Fatalf("expected %d symbolized locations, got:\n%s", wantSymbolizedLocations, got)
+	}
+}
+
+func TestPCAsPointer(t *testing.T) {
+	// Test that a PC is distinct from a heap address, and the
+	// GC can handle a PC as a pointer.
+	// On Wasm, in the old layout, a PC is at a somewhat high
+	// address, but not high enough to completely avoid overlap
+	// with the heap. In this test, we allocate a large slice
+	// to grow the heap so the overlap may occur.
+	pc := abi.FuncPCABIInternal(runtime.GC)
+	t.Logf("pc=%x\n", pc)
+	sinkSlice = make([]byte, 300<<20)
+	if runtime.InHeapOrStack(pc) {
+		t.Errorf("pc=%x is in heap or stack", pc)
+	}
+	// Free the slice. Make a (scannable) pointer from the PC.
+	// If the PC points to the freed memory, the GC will fail.
+	sinkSlice = nil
+	runtime.GC()
+	ptr := unsafe.Pointer(pc)
+	runtime.GC()
+	runtime.KeepAlive(ptr)
 }

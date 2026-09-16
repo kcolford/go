@@ -23,7 +23,7 @@ var (
 	GOROOT    = os.Getenv("GOROOT") // cached for efficiency
 	GOARCH    = envOr("GOARCH", defaultGOARCH)
 	GOOS      = envOr("GOOS", defaultGOOS)
-	GO386     = envOr("GO386", defaultGO386)
+	GO386     = envOr("GO386", DefaultGO386)
 	GOAMD64   = goamd64()
 	GOARM     = goarm()
 	GOARM64   = goarm64()
@@ -34,7 +34,15 @@ var (
 	GOWASM    = gowasm()
 	ToolTags  = toolTags()
 	GO_LDSO   = defaultGO_LDSO
-	Version   = version
+	GOFIPS140 = gofips140()
+	// Version holds the local toolchain name.
+	//
+	// Its value is determined at the time the toolchain is built,
+	// during its bootstrap process. See [cmd/dist.findgoversion].
+	//
+	// Note that this string doesn't include "X:<GOEXPERIMENT>" when any
+	// non-default GOEXPERIMENT values are set while [runtime.Version] does.
+	Version = version
 )
 
 // Error is one of the errors found (if any) in the build configuration.
@@ -56,7 +64,7 @@ func envOr(key, value string) string {
 }
 
 func goamd64() int {
-	switch v := envOr("GOAMD64", defaultGOAMD64); v {
+	switch v := envOr("GOAMD64", DefaultGOAMD64); v {
 	case "v1":
 		return 1
 	case "v2":
@@ -67,15 +75,67 @@ func goamd64() int {
 		return 4
 	}
 	Error = fmt.Errorf("invalid GOAMD64: must be v1, v2, v3, v4")
-	return int(defaultGOAMD64[len("v")] - '0')
+	return int(DefaultGOAMD64[len("v")] - '0')
 }
 
-type goarmFeatures struct {
+func gofips140() string {
+	v := envOr("GOFIPS140", DefaultGOFIPS140)
+	switch v {
+	case "off", "latest", "inprocess", "certified":
+		return v
+	}
+	if isFIPSVersion(v) {
+		return v
+	}
+	Error = fmt.Errorf("invalid GOFIPS140: must be off, latest, inprocess, certified, or v1.Y.Z")
+	return DefaultGOFIPS140
+}
+
+// isFIPSVersion reports whether v is a valid FIPS version,
+// of the form v1.Y.Z or v1.Y.Z-hhhhhhhh or v1.Y.Z-rcN.
+func isFIPSVersion(v string) bool {
+	v, ok := strings.CutPrefix(v, "v1.")
+	if !ok {
+		return false
+	}
+	if v, ok = cutNum(v); !ok {
+		return false
+	}
+	if v, ok = strings.CutPrefix(v, "."); !ok {
+		return false
+	}
+	if v, ok = cutNum(v); !ok {
+		return false
+	}
+	if v == "" {
+		return true
+	}
+	if v, ok = strings.CutPrefix(v, "-rc"); ok {
+		v, ok = cutNum(v)
+		return ok && v == ""
+	}
+	if v, ok = strings.CutPrefix(v, "-"); ok {
+		return len(v) == 8
+	}
+	return false
+}
+
+// cutNum skips the leading text matching [0-9]+
+// in s, returning the rest and whether such text was found.
+func cutNum(s string) (rest string, ok bool) {
+	i := 0
+	for i < len(s) && '0' <= s[i] && s[i] <= '9' {
+		i++
+	}
+	return s[i:], i > 0
+}
+
+type GoarmFeatures struct {
 	Version   int
 	SoftFloat bool
 }
 
-func (g goarmFeatures) String() string {
+func (g GoarmFeatures) String() string {
 	armStr := strconv.Itoa(g.Version)
 	if g.SoftFloat {
 		armStr += ",softfloat"
@@ -85,12 +145,12 @@ func (g goarmFeatures) String() string {
 	return armStr
 }
 
-func goarm() (g goarmFeatures) {
+func goarm() (g GoarmFeatures) {
 	const (
 		softFloatOpt = ",softfloat"
 		hardFloatOpt = ",hardfloat"
 	)
-	def := defaultGOARM
+	def := DefaultGOARM
 	if GOOS == "android" && GOARCH == "arm" {
 		// Android arm devices always support GOARM=7.
 		def = "7"
@@ -186,14 +246,14 @@ func ParseGoarm64(v string) (g Goarm64Features, e error) {
 	default:
 		e = fmt.Errorf("invalid GOARM64: must start with v8.{0-9} or v9.{0-5} and may optionally end in %q and/or %q",
 			lseOpt, cryptoOpt)
-		g.Version = defaultGOARM64
+		g.Version = DefaultGOARM64
 	}
 
 	return
 }
 
 func goarm64() (g Goarm64Features) {
-	g, Error = ParseGoarm64(envOr("GOARM64", defaultGOARM64))
+	g, Error = ParseGoarm64(envOr("GOARM64", DefaultGOARM64))
 	return
 }
 
@@ -229,25 +289,25 @@ func (g Goarm64Features) Supports(s string) bool {
 }
 
 func gomips() string {
-	switch v := envOr("GOMIPS", defaultGOMIPS); v {
+	switch v := envOr("GOMIPS", DefaultGOMIPS); v {
 	case "hardfloat", "softfloat":
 		return v
 	}
 	Error = fmt.Errorf("invalid GOMIPS: must be hardfloat, softfloat")
-	return defaultGOMIPS
+	return DefaultGOMIPS
 }
 
 func gomips64() string {
-	switch v := envOr("GOMIPS64", defaultGOMIPS64); v {
+	switch v := envOr("GOMIPS64", DefaultGOMIPS64); v {
 	case "hardfloat", "softfloat":
 		return v
 	}
 	Error = fmt.Errorf("invalid GOMIPS64: must be hardfloat, softfloat")
-	return defaultGOMIPS64
+	return DefaultGOMIPS64
 }
 
 func goppc64() int {
-	switch v := envOr("GOPPC64", defaultGOPPC64); v {
+	switch v := envOr("GOPPC64", DefaultGOPPC64); v {
 	case "power8":
 		return 8
 	case "power9":
@@ -256,18 +316,20 @@ func goppc64() int {
 		return 10
 	}
 	Error = fmt.Errorf("invalid GOPPC64: must be power8, power9, power10")
-	return int(defaultGOPPC64[len("power")] - '0')
+	return int(DefaultGOPPC64[len("power")] - '0')
 }
 
 func goriscv64() int {
-	switch v := envOr("GORISCV64", defaultGORISCV64); v {
+	switch v := envOr("GORISCV64", DefaultGORISCV64); v {
 	case "rva20u64":
 		return 20
 	case "rva22u64":
 		return 22
+	case "rva23u64":
+		return 23
 	}
-	Error = fmt.Errorf("invalid GORISCV64: must be rva20u64, rva22u64")
-	v := defaultGORISCV64[len("rva"):]
+	Error = fmt.Errorf("invalid GORISCV64: must be rva20u64, rva22u64, rva23u64")
+	v := DefaultGORISCV64[len("rva"):]
 	i := strings.IndexFunc(v, func(r rune) bool {
 		return r < '0' || r > '9'
 	})
@@ -276,28 +338,23 @@ func goriscv64() int {
 }
 
 type gowasmFeatures struct {
-	SatConv bool
-	SignExt bool
+	// Legacy features, now always enabled
+	//SatConv bool
+	//SignExt bool
 }
 
 func (f gowasmFeatures) String() string {
 	var flags []string
-	if f.SatConv {
-		flags = append(flags, "satconv")
-	}
-	if f.SignExt {
-		flags = append(flags, "signext")
-	}
 	return strings.Join(flags, ",")
 }
 
 func gowasm() (f gowasmFeatures) {
-	for _, opt := range strings.Split(envOr("GOWASM", ""), ",") {
+	for opt := range strings.SplitSeq(envOr("GOWASM", ""), ",") {
 		switch opt {
 		case "satconv":
-			f.SatConv = true
+			// ignore, always enabled
 		case "signext":
-			f.SignExt = true
+			// ignore, always enabled
 		case "":
 			// ignore
 		default:
@@ -348,6 +405,8 @@ func GOGOARCH() (name, value string) {
 		return "GOMIPS64", GOMIPS64
 	case "ppc64", "ppc64le":
 		return "GOPPC64", fmt.Sprintf("power%d", GOPPC64)
+	case "riscv64":
+		return "GORISCV64", fmt.Sprintf("rva%du64", GORISCV64)
 	case "wasm":
 		return "GOWASM", GOWASM.String()
 	}
@@ -399,15 +458,16 @@ func gogoarchTags() []string {
 		if GORISCV64 >= 22 {
 			list = append(list, GOARCH+"."+"rva22u64")
 		}
+		if GORISCV64 >= 23 {
+			list = append(list, GOARCH+"."+"rva23u64")
+		}
 		return list
 	case "wasm":
 		var list []string
-		if GOWASM.SatConv {
-			list = append(list, GOARCH+".satconv")
-		}
-		if GOWASM.SignExt {
-			list = append(list, GOARCH+".signext")
-		}
+		// SatConv is always enabled
+		list = append(list, GOARCH+".satconv")
+		// SignExt is always enabled
+		list = append(list, GOARCH+".signext")
 		return list
 	}
 	return nil

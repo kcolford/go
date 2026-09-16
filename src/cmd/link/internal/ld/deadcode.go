@@ -50,7 +50,7 @@ func (d *deadcodePass) init() {
 		n := d.ldr.NDef()
 		for i := 1; i < n; i++ {
 			s := loader.Sym(i)
-			if d.ldr.SymType(s) == sym.STEXT && d.ldr.SymSize(s) == 0 {
+			if d.ldr.SymType(s).IsText() && d.ldr.SymSize(s) == 0 {
 				// Zero-sized text symbol is a function deadcoded by the
 				// compiler. It doesn't really get compiled, and its
 				// metadata may be missing.
@@ -113,6 +113,13 @@ func (d *deadcodePass) init() {
 	for _, s := range d.ctxt.dynexp {
 		if d.ctxt.Debugvlog > 1 {
 			d.ctxt.Logf("deadcode start dynexp: %s<%d>\n", d.ldr.SymName(s), d.ldr.SymVersion(s))
+		}
+		d.mark(s, 0)
+	}
+	// So are wasmexports.
+	for _, s := range d.ldr.WasmExports {
+		if d.ctxt.Debugvlog > 1 {
+			d.ctxt.Logf("deadcode start wasmexport: %s<%d>\n", d.ldr.SymName(s), d.ldr.SymVersion(s))
 		}
 		d.mark(s, 0)
 	}
@@ -538,27 +545,7 @@ func (d *deadcodePass) decodetypeMethods(ldr *loader.Loader, arch *sys.Arch, sym
 	if !decodetypeHasUncommon(arch, p) {
 		panic(fmt.Sprintf("no methods on %q", ldr.SymName(symIdx)))
 	}
-	off := commonsize(arch) // reflect.rtype
-	switch decodetypeKind(arch, p) {
-	case abi.Struct: // reflect.structType
-		off += 4 * arch.PtrSize
-	case abi.Pointer: // reflect.ptrType
-		off += arch.PtrSize
-	case abi.Func: // reflect.funcType
-		off += arch.PtrSize // 4 bytes, pointer aligned
-	case abi.Slice: // reflect.sliceType
-		off += arch.PtrSize
-	case abi.Array: // reflect.arrayType
-		off += 3 * arch.PtrSize
-	case abi.Chan: // reflect.chanType
-		off += 2 * arch.PtrSize
-	case abi.Map: // reflect.mapType
-		off += 4*arch.PtrSize + 8
-	case abi.Interface: // reflect.interfaceType
-		off += 3 * arch.PtrSize
-	default:
-		// just Sizeof(rtype)
-	}
+	off := abi.RTypeSize(decodetypeKind(arch, p), arch.PtrSize)
 
 	mcount := int(decodeInuxi(arch, p[off+4:], 2))
 	moff := int(decodeInuxi(arch, p[off+4+2+2:], 4))

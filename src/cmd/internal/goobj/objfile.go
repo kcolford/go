@@ -55,6 +55,7 @@ import (
 //       Flag  uint8
 //       Flag2 uint8
 //       Size  uint32
+//       Align uint32
 //    }
 //    Hashed64Defs [...]struct { // short hashed (content-addressable) symbol definitions
 //       ... // same as SymbolDefs
@@ -305,7 +306,9 @@ const (
 	SymFlagDict
 	SymFlagPkgInit
 	SymFlagLinkname
+	SymFlagLinknameStd
 	SymFlagABIWrapper
+	SymFlagWasmExport
 )
 
 // Returns the length of the name of the symbol.
@@ -338,7 +341,9 @@ func (s *Sym) IsItab() bool        { return s.Flag2()&SymFlagItab != 0 }
 func (s *Sym) IsDict() bool        { return s.Flag2()&SymFlagDict != 0 }
 func (s *Sym) IsPkgInit() bool     { return s.Flag2()&SymFlagPkgInit != 0 }
 func (s *Sym) IsLinkname() bool    { return s.Flag2()&SymFlagLinkname != 0 }
+func (s *Sym) IsLinknameStd() bool { return s.Flag2()&SymFlagLinknameStd != 0 }
 func (s *Sym) ABIWrapper() bool    { return s.Flag2()&SymFlagABIWrapper != 0 }
+func (s *Sym) WasmExport() bool    { return s.Flag2()&SymFlagWasmExport != 0 }
 
 func (s *Sym) SetName(x string, w *Writer) {
 	binary.LittleEndian.PutUint32(s[:], uint32(len(x)))
@@ -447,6 +452,7 @@ const (
 	AuxPcinline
 	AuxPcdata
 	AuxWasmImport
+	AuxWasmType
 	AuxSehUnwindInfo
 )
 
@@ -631,27 +637,9 @@ func (r *Reader) uint64At(off uint32) uint64 {
 	return binary.LittleEndian.Uint64(b)
 }
 
-func (r *Reader) int64At(off uint32) int64 {
-	return int64(r.uint64At(off))
-}
-
 func (r *Reader) uint32At(off uint32) uint32 {
 	b := r.BytesAt(off, 4)
 	return binary.LittleEndian.Uint32(b)
-}
-
-func (r *Reader) int32At(off uint32) int32 {
-	return int32(r.uint32At(off))
-}
-
-func (r *Reader) uint16At(off uint32) uint16 {
-	b := r.BytesAt(off, 2)
-	return binary.LittleEndian.Uint16(b)
-}
-
-func (r *Reader) uint8At(off uint32) uint8 {
-	b := r.BytesAt(off, 1)
-	return b[0]
 }
 
 func (r *Reader) StringAt(off uint32, len uint32) string {
@@ -741,7 +729,7 @@ func (r *Reader) NNonpkgref() int {
 
 // SymOff returns the offset of the i-th symbol.
 func (r *Reader) SymOff(i uint32) uint32 {
-	return r.h.Offsets[BlkSymdef] + uint32(i*SymSize)
+	return r.h.Offsets[BlkSymdef] + i*SymSize
 }
 
 // Sym returns a pointer to the i-th symbol.
@@ -766,7 +754,7 @@ func (r *Reader) RefFlags(i int) *RefFlags {
 // Note: here i is the index of short hashed symbols, not all symbols
 // (unlike other accessors).
 func (r *Reader) Hash64(i uint32) uint64 {
-	off := r.h.Offsets[BlkHash64] + uint32(i*Hash64Size)
+	off := r.h.Offsets[BlkHash64] + i*Hash64Size
 	return r.uint64At(off)
 }
 
@@ -774,19 +762,19 @@ func (r *Reader) Hash64(i uint32) uint64 {
 // Note: here i is the index of hashed symbols, not all symbols
 // (unlike other accessors).
 func (r *Reader) Hash(i uint32) *HashType {
-	off := r.h.Offsets[BlkHash] + uint32(i*HashSize)
+	off := r.h.Offsets[BlkHash] + i*HashSize
 	return (*HashType)(unsafe.Pointer(&r.b[off]))
 }
 
 // NReloc returns the number of relocations of the i-th symbol.
 func (r *Reader) NReloc(i uint32) int {
-	relocIdxOff := r.h.Offsets[BlkRelocIdx] + uint32(i*4)
+	relocIdxOff := r.h.Offsets[BlkRelocIdx] + i*4
 	return int(r.uint32At(relocIdxOff+4) - r.uint32At(relocIdxOff))
 }
 
 // RelocOff returns the offset of the j-th relocation of the i-th symbol.
 func (r *Reader) RelocOff(i uint32, j int) uint32 {
-	relocIdxOff := r.h.Offsets[BlkRelocIdx] + uint32(i*4)
+	relocIdxOff := r.h.Offsets[BlkRelocIdx] + i*4
 	relocIdx := r.uint32At(relocIdxOff)
 	return r.h.Offsets[BlkReloc] + (relocIdx+uint32(j))*uint32(RelocSize)
 }

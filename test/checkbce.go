@@ -26,7 +26,7 @@ func f1(a [256]int, i int) {
 	var j int
 	useInt(a[i]) // ERROR "Found IsInBounds$"
 	j = i % 256
-	useInt(a[j]) // ERROR "Found IsInBounds$"
+	useInt(a[j])
 	j = i & 255
 	useInt(a[j])
 	j = i & 17
@@ -159,16 +159,14 @@ func decode1(data []byte) (x uint64) {
 }
 
 func decode2(data []byte) (x uint64) {
-	// TODO(rasky): this should behave like decode1 and compile to no
-	// boundchecks. We're currently not able to remove all of them.
 	for len(data) >= 32 {
 		x += binary.BigEndian.Uint64(data)
 		data = data[8:]
-		x += binary.BigEndian.Uint64(data) // ERROR "Found IsInBounds$"
+		x += binary.BigEndian.Uint64(data)
 		data = data[8:]
-		x += binary.BigEndian.Uint64(data) // ERROR "Found IsInBounds$"
+		x += binary.BigEndian.Uint64(data)
 		data = data[8:]
-		x += binary.BigEndian.Uint64(data) // ERROR "Found IsInBounds$"
+		x += binary.BigEndian.Uint64(data)
 		data = data[8:]
 	}
 	return x

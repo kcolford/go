@@ -9,7 +9,6 @@ package ir
 import (
 	"fmt"
 	"go/constant"
-	"sort"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/types"
@@ -19,6 +18,9 @@ import (
 // A Node is the abstract interface to an IR node.
 type Node interface {
 	// Formatting
+	// For debugging output, use one of
+	//  Dump/FDump/DumpList/FDumplist (in fmt.go)
+	//  DumpAny/FDumpAny (in dump.go)
 	Format(s fmt.State, verb rune)
 
 	// Source position.
@@ -29,6 +31,7 @@ type Node interface {
 	copy() Node
 
 	doChildren(func(Node) bool) bool
+	doChildrenWithHidden(func(Node) bool) bool
 	editChildren(func(Node) Node)
 	editChildrenWithHidden(func(Node) Node)
 
@@ -215,7 +218,7 @@ const (
 	ORSH              // X >> Y
 	OAND              // X & Y
 	OANDNOT           // X &^ Y
-	ONEW              // new(X); corresponds to calls to new in source code
+	ONEW              // new(X); corresponds to calls to new(T) in source code
 	ONOT              // !X
 	OBITNOT           // ^X
 	OPLUS             // +X
@@ -234,7 +237,6 @@ const (
 	OSLICEHEADER      // sliceheader{Ptr, Len, Cap} (Ptr is unsafe.Pointer, Len is length, Cap is capacity)
 	OSTRINGHEADER     // stringheader{Ptr, Len} (Ptr is unsafe.Pointer, Len is length)
 	ORECOVER          // recover()
-	ORECOVERFP        // recover(Args) w/ explicit FP argument
 	ORECV             // <-X
 	ORUNESTR          // Type(X) (Type is string, X is rune)
 	OSELRECV2         // like OAS2: Lhs = Rhs where len(Lhs)=2, len(Rhs)=1, Rhs[0].Op = ORECV (appears as .Var of OCASE)
@@ -294,6 +296,7 @@ const (
 	OLINKSYMOFFSET   // offset within a name
 	OJUMPTABLE       // A jump table structure for implementing dense expression switches
 	OINTERFACESWITCH // A type switch with interface cases
+	OMOVE2HEAP       // Promote a stack-backed slice to heap
 
 	// opcodes for generics
 	ODYNAMICDOTTYPE  // x = i.(T) where T is a type parameter (or derived from a type parameter)
@@ -303,8 +306,7 @@ const (
 	// arch-specific opcodes
 	OTAILCALL    // tail call to another function
 	OGETG        // runtime.getg() (read g pointer)
-	OGETCALLERPC // runtime.getcallerpc() (continuation PC in caller frame)
-	OGETCALLERSP // runtime.getcallersp() (stack pointer in caller frame)
+	OGETCALLERSP // internal/runtime/sys.GetCallerSP() (stack pointer in caller frame)
 
 	OEND
 )
@@ -426,16 +428,6 @@ func (s *NameSet) Add(n *Name) {
 		*s = make(map[*Name]struct{})
 	}
 	(*s)[n] = struct{}{}
-}
-
-// Sorted returns s sorted according to less.
-func (s NameSet) Sorted(less func(*Name, *Name) bool) []*Name {
-	var res []*Name
-	for n := range s {
-		res = append(res, n)
-	}
-	sort.Slice(res, func(i, j int) bool { return less(res[i], res[j]) })
-	return res
 }
 
 type PragmaFlag uint16

@@ -309,7 +309,6 @@ func TestSelfSelect(t *testing.T) {
 		wg.Add(2)
 		c := make(chan int, chanCap)
 		for p := 0; p < 2; p++ {
-			p := p
 			go func() {
 				defer wg.Done()
 				for i := 0; i < 1000; i++ {
@@ -359,7 +358,6 @@ func TestSelectStress(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(10)
 	for k := 0; k < 4; k++ {
-		k := k
 		go func() {
 			for i := 0; i < N; i++ {
 				c[k] <- 0
@@ -597,7 +595,7 @@ func TestMultiConsumer(t *testing.T) {
 func TestShrinkStackDuringBlockedSend(t *testing.T) {
 	// make sure that channel operations still work when we are
 	// blocked on a channel send and we shrink the stack.
-	// NOTE: this test probably won't fail unless stack1.go:stackDebug
+	// NOTE: this test probably won't fail unless stack.go:stackDebug
 	// is set to >= 1.
 	const n = 10
 	c := make(chan int)

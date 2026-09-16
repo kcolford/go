@@ -31,63 +31,116 @@ type file struct {
 	appendMode bool                    // whether file is opened for appending
 }
 
-// Fd returns the Windows handle referencing the open file.
-// If f is closed, the file descriptor becomes invalid.
-// If f is garbage collected, a finalizer may close the file descriptor,
-// making it invalid; see [runtime.SetFinalizer] for more information on when
-// a finalizer might be run. On Unix systems this will cause the [File.SetDeadline]
-// methods to stop working.
-func (file *File) Fd() uintptr {
+// fd is the Windows implementation of Fd.
+func (file *File) fd() uintptr {
 	if file == nil {
 		return uintptr(syscall.InvalidHandle)
 	}
+	// Try to disassociate the file from the runtime poller.
+	// File.Fd doesn't return an error, so we don't have a way to
+	// report it. We just ignore it. It's up to the caller to call
+	// it when there are no concurrent IO operations.
+	_ = file.pfd.DisassociateIOCP()
 	return uintptr(file.pfd.Sysfd)
 }
 
+// newFileKind describes the kind of file to newFile.
+type newFileKind int
+
+const (
+	// kindNewFile means that the descriptor was passed to us via NewFile.
+	kindNewFile newFileKind = iota
+	// kindOpenFile means that the descriptor was opened using
+	// Open, Create, or OpenFile.
+	kindOpenFile
+	// kindPipe means that the descriptor was opened using Pipe.
+	kindPipe
+	// kindSock means that the descriptor is a network file descriptor
+	// that was created from net package and was opened using net_newUnixFile.
+	kindSock
+	// kindConsole means that the descriptor is a console handle.
+	kindConsole
+)
+
 // newFile returns a new File with the given file handle and name.
 // Unlike NewFile, it does not check that h is syscall.InvalidHandle.
-func newFile(h syscall.Handle, name string, kind string) *File {
-	if kind == "file" {
-		var m uint32
-		if syscall.GetConsoleMode(h, &m) == nil {
-			kind = "console"
+// If nonBlocking is true, it tries to add the file to the runtime poller.
+func newFile(h syscall.Handle, name string, kind newFileKind, nonBlocking bool) *File {
+	typ := "file"
+	switch kind {
+	case kindNewFile, kindOpenFile:
+		t, err := syscall.GetFileType(h)
+		if err != nil || t == syscall.FILE_TYPE_CHAR {
+			var m uint32
+			if syscall.GetConsoleMode(h, &m) == nil {
+				typ = "console"
+				// Console handles are always blocking.
+				break
+			}
+		} else if t == syscall.FILE_TYPE_PIPE {
+			typ = "pipe"
 		}
-		if t, err := syscall.GetFileType(h); err == nil && t == syscall.FILE_TYPE_PIPE {
-			kind = "pipe"
-		}
+	case kindPipe:
+		typ = "pipe"
+	case kindSock:
+		typ = "file+net"
+	case kindConsole:
+		typ = "console"
+	default:
+		panic("newFile with unknown kind")
 	}
 
+	// Completion notification modes are shared by all handles to the file
+	// object. Preserve them for handles passed to NewFile, since other users
+	// of the file object may rely on those modes. See go.dev/issue/80979.
 	f := &File{&file{
 		pfd: poll.FD{
-			Sysfd:         h,
-			IsStream:      true,
-			ZeroReadIsEOF: true,
+			Sysfd:                   h,
+			IsStream:                true,
+			ZeroReadIsEOF:           true,
+			KeepFileCompletionModes: kind == kindNewFile,
 		},
 		name: name,
 	}}
 	runtime.SetFinalizer(f.file, (*file).close)
 
+	overlapped := &nonBlocking
+	if kind == kindNewFile && typ != "console" {
+		// Detecting the mode can block behind outstanding synchronous I/O.
+		// Defer it until first use, including for inherited standard handles.
+		// See go.dev/issue/75949 and go.dev/issue/76391.
+		overlapped = nil
+	}
 	// Ignore initialization errors.
 	// Assume any problems will show up in later I/O.
-	f.pfd.Init(kind, false)
-
+	f.pfd.Init(typ, overlapped)
 	return f
 }
 
 // newConsoleFile creates new File that will be used as console.
 func newConsoleFile(h syscall.Handle, name string) *File {
-	return newFile(h, name, "console")
+	return newFile(h, name, kindConsole, false)
 }
 
-// NewFile returns a new File with the given file descriptor and
-// name. The returned value will be nil if fd is not a valid file
-// descriptor.
-func NewFile(fd uintptr, name string) *File {
+// newFileFromNewFile is called by [NewFile].
+func newFileFromNewFile(fd uintptr, name string) *File {
 	h := syscall.Handle(fd)
 	if h == syscall.InvalidHandle {
 		return nil
 	}
-	return newFile(h, name, "file")
+	return newFile(h, name, kindNewFile, false)
+}
+
+// net_newWindowsFile is a hidden entry point called by net.conn.File.
+// This is used so that the File.pfd.close method calls [syscall.Closesocket]
+// instead of [syscall.CloseHandle].
+//
+//go:linkname net_newWindowsFile net.newWindowsFile
+func net_newWindowsFile(h syscall.Handle, name string) *File {
+	if h == syscall.InvalidHandle {
+		panic("invalid FD")
+	}
+	return newFile(h, name, kindSock, true)
 }
 
 func epipecheck(file *File, e error) {
@@ -103,26 +156,16 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 		return nil, &PathError{Op: "open", Path: name, Err: syscall.ENOENT}
 	}
 	path := fixLongPath(name)
-	r, e := syscall.Open(path, flag|syscall.O_CLOEXEC, syscallMode(perm))
-	if e != nil {
-		// We should return EISDIR when we are trying to open a directory with write access.
-		if e == syscall.ERROR_ACCESS_DENIED && (flag&O_WRONLY != 0 || flag&O_RDWR != 0) {
-			pathp, e1 := syscall.UTF16PtrFromString(path)
-			if e1 == nil {
-				var fa syscall.Win32FileAttributeData
-				e1 = syscall.GetFileAttributesEx(pathp, syscall.GetFileExInfoStandard, (*byte)(unsafe.Pointer(&fa)))
-				if e1 == nil && fa.FileAttributes&syscall.FILE_ATTRIBUTE_DIRECTORY != 0 {
-					e = syscall.EISDIR
-				}
-			}
-		}
-		return nil, &PathError{Op: "open", Path: name, Err: e}
+	r, err := syscall.Open(path, flag|syscall.O_CLOEXEC, syscallMode(perm))
+	if err != nil {
+		return nil, &PathError{Op: "open", Path: name, Err: err}
 	}
-	return newFile(r, name, "file"), nil
+	nonblocking := flag&windows.O_FILE_FLAG_OVERLAPPED != 0
+	return newFile(r, name, kindOpenFile, nonblocking), nil
 }
 
 func openDirNolog(name string) (*File, error) {
-	return openFileNolog(name, O_RDONLY, 0)
+	return openFileNolog(name, O_RDONLY|windows.O_DIRECTORY, 0)
 }
 
 func (file *file) close() error {
@@ -176,7 +219,7 @@ func Truncate(name string, size int64) error {
 }
 
 // Remove removes the named file or directory.
-// If there is an error, it will be of type *PathError.
+// If there is an error, it will be of type [*PathError].
 func Remove(name string) error {
 	p, e := syscall.UTF16PtrFromString(fixLongPath(name))
 	if e != nil {
@@ -231,20 +274,17 @@ func Pipe() (r *File, w *File, err error) {
 	if e != nil {
 		return nil, nil, NewSyscallError("pipe", e)
 	}
-	return newFile(p[0], "|0", "pipe"), newFile(p[1], "|1", "pipe"), nil
+	// syscall.Pipe always returns a non-blocking handle.
+	return newFile(p[0], "|0", kindPipe, false), newFile(p[1], "|1", kindPipe, false), nil
 }
 
-var (
-	useGetTempPath2Once sync.Once
-	useGetTempPath2     bool
-)
+var useGetTempPath2 = sync.OnceValue(func() bool {
+	return windows.ErrorLoadingGetTempPath2() == nil
+})
 
 func tempDir() string {
-	useGetTempPath2Once.Do(func() {
-		useGetTempPath2 = (windows.ErrorLoadingGetTempPath2() == nil)
-	})
 	getTempPath := syscall.GetTempPath
-	if useGetTempPath2 {
+	if useGetTempPath2() {
 		getTempPath = windows.GetTempPath2
 	}
 	n := uint32(syscall.MAX_PATH)
@@ -430,10 +470,13 @@ func readReparseLink(path string) (string, error) {
 		return "", err
 	}
 	defer syscall.CloseHandle(h)
+	return readReparseLinkHandle(h)
+}
 
+func readReparseLinkHandle(h syscall.Handle) (string, error) {
 	rdbbuf := make([]byte, syscall.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
 	var bytesReturned uint32
-	err = syscall.DeviceIoControl(h, syscall.FSCTL_GET_REPARSE_POINT, nil, 0, &rdbbuf[0], uint32(len(rdbbuf)), &bytesReturned, nil)
+	err := syscall.DeviceIoControl(h, syscall.FSCTL_GET_REPARSE_POINT, nil, 0, &rdbbuf[0], uint32(len(rdbbuf)), &bytesReturned, nil)
 	if err != nil {
 		return "", err
 	}

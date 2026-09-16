@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/rand"
 	"strings"
+	"sync"
 )
 
 // An Int represents a signed multi-precision integer.
@@ -181,18 +182,25 @@ func (z *Int) Sub(x, y *Int) *Int {
 
 // Mul sets z to the product x*y and returns z.
 func (z *Int) Mul(x, y *Int) *Int {
+	z.mul(nil, x, y)
+	return z
+}
+
+// mul is like Mul but takes an explicit stack to use, for internal use.
+// It does not return a *Int because doing so makes the stack-allocated Ints
+// used in natmul.go escape to the heap (even though the result is unused).
+func (z *Int) mul(stk *stack, x, y *Int) {
 	// x * y == x * y
 	// x * (-y) == -(x * y)
 	// (-x) * y == -(x * y)
 	// (-x) * (-y) == x * y
 	if x == y {
-		z.abs = z.abs.sqr(x.abs)
+		z.abs = z.abs.sqr(stk, x.abs)
 		z.neg = false
-		return z
+		return
 	}
-	z.abs = z.abs.mul(x.abs, y.abs)
+	z.abs = z.abs.mul(stk, x.abs, y.abs)
 	z.neg = len(z.abs) > 0 && x.neg != y.neg // 0 has no sign
-	return z
 }
 
 // MulRange sets z to the product of all integers
@@ -213,14 +221,14 @@ func (z *Int) MulRange(a, b int64) *Int {
 		a, b = -b, -a
 	}
 
-	z.abs = z.abs.mulRange(uint64(a), uint64(b))
+	z.abs = z.abs.mulRange(nil, uint64(a), uint64(b))
 	z.neg = neg
 	return z
 }
 
 // Binomial sets z to the binomial coefficient C(n, k) and returns z.
 func (z *Int) Binomial(n, k int64) *Int {
-	if k > n {
+	if k > n || k < 0 {
 		return z.SetInt64(0)
 	}
 	// reduce the number of multiplications by reducing k
@@ -264,7 +272,7 @@ func (z *Int) Binomial(n, k int64) *Int {
 // If y == 0, a division-by-zero run-time panic occurs.
 // Quo implements truncated division (like Go); see [Int.QuoRem] for more details.
 func (z *Int) Quo(x, y *Int) *Int {
-	z.abs, _ = z.abs.div(nil, x.abs, y.abs)
+	z.abs, _ = z.abs.div(nil, nil, x.abs, y.abs)
 	z.neg = len(z.abs) > 0 && x.neg != y.neg // 0 has no sign
 	return z
 }
@@ -273,7 +281,7 @@ func (z *Int) Quo(x, y *Int) *Int {
 // If y == 0, a division-by-zero run-time panic occurs.
 // Rem implements truncated modulus (like Go); see [Int.QuoRem] for more details.
 func (z *Int) Rem(x, y *Int) *Int {
-	_, z.abs = nat(nil).div(z.abs, x.abs, y.abs)
+	_, z.abs = nat(nil).div(nil, z.abs, x.abs, y.abs)
 	z.neg = len(z.abs) > 0 && x.neg // 0 has no sign
 	return z
 }
@@ -288,9 +296,9 @@ func (z *Int) Rem(x, y *Int) *Int {
 //	r = x - y*q
 //
 // (See Daan Leijen, “Division and Modulus for Computer Scientists”.)
-// See [DivMod] for Euclidean division and modulus (unlike Go).
+// See [Int.DivMod] for Euclidean division and modulus (unlike Go).
 func (z *Int) QuoRem(x, y, r *Int) (*Int, *Int) {
-	z.abs, r.abs = z.abs.div(r.abs, x.abs, y.abs)
+	z.abs, r.abs = z.abs.div(nil, r.abs, x.abs, y.abs)
 	z.neg, r.neg = len(z.abs) > 0 && x.neg != y.neg, len(r.abs) > 0 && x.neg // 0 has no sign
 	return z, r
 }
@@ -348,7 +356,7 @@ func (z *Int) Mod(x, y *Int) *Int {
 // See [Int.QuoRem] for T-division and modulus (like Go).
 func (z *Int) DivMod(x, y, m *Int) (*Int, *Int) {
 	y0 := y // save y
-	if z == y || alias(z.abs, y.abs) {
+	if z == y || m == y || alias(z.abs, y.abs) || alias(m.abs, y.abs) {
 		y0 = new(Int).Set(y)
 	}
 	z.QuoRem(x, y, m)
@@ -362,6 +370,89 @@ func (z *Int) DivMod(x, y, m *Int) (*Int, *Int) {
 		}
 	}
 	return z, m
+}
+
+// Rounding modes that determine how the integer quotient is adjusted in an integer division.
+// See Daan Leijen, “Division and Modulus for Computer Scientists”, for details.
+const (
+	Trunc = ToZero        // T-division (same as Go division)
+	Floor = ToNegativeInf // F-division
+	Round = ToNearestEven // R-division
+	Ceil  = ToPositiveInf // C-division
+)
+
+// Divide computes the integer quotient q and remainder r such that
+//
+//	q = f(x/y)
+//	r = x - y*q
+//
+// where f is described by the rounding mode,
+// which must be one of [Trunc], [Floor], [Round] or [Ceil].
+// Divide sets z to q if z != nil, updates r if r != nil,
+// and returns the pair (z, r) if y != 0.
+// If y == 0, a division-by-zero run-time panic occurs.
+func (z *Int) Divide(x, y, r *Int, mode RoundingMode) (*Int, *Int) {
+	// TODO: optimize the code where z or r is nil
+	var z_abs nat
+	if z != nil {
+		z_abs = z.abs
+	}
+	var r_neg bool
+	var r_abs nat
+	if r != nil {
+		r_abs = r.abs
+	}
+	y_abs := y.abs // save y
+	if z == y || r == y || alias(z_abs, y.abs) || alias(r_abs, y.abs) {
+		y_abs = nat(nil).set(y.abs)
+	}
+	neg := x.neg != y.neg
+	z_abs, r_abs = z_abs.div(nil, r_abs, x.abs, y.abs)
+	if len(r_abs) > 0 {
+		switch mode {
+		case Trunc:
+			r_neg = x.neg
+		case Floor:
+			r_neg = y.neg
+			if neg {
+				z_abs = z_abs.add(z_abs, natOne)
+				r_abs = r_abs.sub(y_abs, r_abs)
+			}
+		case Ceil:
+			r_neg = !y.neg
+			if !neg {
+				z_abs = z_abs.add(z_abs, natOne)
+				r_abs = r_abs.sub(y_abs, r_abs)
+			}
+		case Round:
+			switch nat(nil).mul(nil, r_abs, natTwo).cmp(y_abs) {
+			case -1:
+				r_neg = x.neg
+			case 0:
+				even := len(z_abs) == 0 || z_abs[0]&1 == 0
+				if even {
+					r_neg = x.neg
+					break
+				}
+				fallthrough
+			case 1:
+				r_neg = !x.neg
+				z_abs = z_abs.add(z_abs, natOne)
+				r_abs = r_abs.sub(y_abs, r_abs)
+			}
+		default:
+			panic("unsupported rounding mode")
+		}
+	}
+	if z != nil {
+		z.abs = z_abs
+		z.neg = neg && len(z_abs) > 0 // 0 has no sign
+	}
+	if r != nil {
+		r.abs = r_abs
+		r.neg = r_neg
+	}
+	return z, r
 }
 
 // Cmp compares x and y and returns:
@@ -589,7 +680,7 @@ func (z *Int) exp(x, y, m *Int, slow bool) *Int {
 		mWords = m.abs // m.abs may be nil for m == 0
 	}
 
-	z.abs = z.abs.expNN(xWords, yWords, mWords, slow)
+	z.abs = z.abs.expNN(nil, xWords, yWords, mWords, slow)
 	z.neg = len(z.abs) > 0 && x.neg && len(yWords) > 0 && yWords[0]&1 == 1 // 0 has no sign
 	if z.neg && len(mWords) > 0 {
 		// make modulus result positive
@@ -707,42 +798,64 @@ func lehmerSimulate(A, B *Int) (u0, u1, v0, v1 Word, even bool) {
 // For even == true: u0, v1 >= 0 && u1, v0 <= 0
 // For even == false: u0, v1 <= 0 && u1, v0 >= 0
 // q, r, s, t are temporary variables to avoid allocations in the multiplication.
-func lehmerUpdate(A, B, q, r, s, t *Int, u0, u1, v0, v1 Word, even bool) {
+func lehmerUpdate(A, B, q, r *Int, u0, u1, v0, v1 Word, even bool) {
+	mulW(q, B, even, v0)
+	mulW(r, A, even, u1)
+	mulW(A, A, !even, u0)
+	mulW(B, B, !even, v1)
+	A.Add(A, q)
+	B.Add(B, r)
+}
 
-	t.abs = t.abs.setWord(u0)
-	s.abs = s.abs.setWord(v0)
-	t.neg = !even
-	s.neg = even
-
-	t.Mul(A, t)
-	s.Mul(B, s)
-
-	r.abs = r.abs.setWord(u1)
-	q.abs = q.abs.setWord(v1)
-	r.neg = even
-	q.neg = !even
-
-	r.Mul(A, r)
-	q.Mul(B, q)
-
-	A.Add(t, s)
-	B.Add(r, q)
+// mulW sets z = x * (-?)w
+// where the minus sign is present when neg is true.
+func mulW(z, x *Int, neg bool, w Word) {
+	z.abs = z.abs.mulAddWW(x.abs, w, 0)
+	z.neg = x.neg != neg
 }
 
 // euclidUpdate performs a single step of the Euclidean GCD algorithm
 // if extended is true, it also updates the cosequence Ua, Ub.
-func euclidUpdate(A, B, Ua, Ub, q, r, s, t *Int, extended bool) {
-	q, r = q.QuoRem(A, B, r)
-
-	*A, *B, *r = *B, *r, *A
+// q and r are used as temporaries; the initial values are ignored.
+func euclidUpdate(A, B, Ua, Ub, q, r *Int, extended bool) (nA, nB, nr, nUa, nUb *Int) {
+	q.QuoRem(A, B, r)
 
 	if extended {
-		// Ua, Ub = Ub, Ua - q*Ub
-		t.Set(Ub)
-		s.Mul(Ub, q)
-		Ub.Sub(Ua, s)
-		Ua.Set(t)
+		// Ua, Ub = Ub, Ua-q*Ub
+		q.Mul(q, Ub)
+		Ua, Ub = Ub, Ua
+		Ub.Sub(Ub, q)
 	}
+
+	return B, r, A, Ua, Ub
+}
+
+// sixIntPool is used to reduce allocation of limbs used in temporary integers
+// used to calculate lehmerGCD.
+type sixIntPool struct {
+	pool sync.Pool
+}
+
+func (t *sixIntPool) put(data *[6]Int) {
+	data[0].SetInt64(0)
+	data[1].SetInt64(0)
+	data[2].SetInt64(0)
+	data[3].SetInt64(0)
+	data[4].SetInt64(0)
+	data[5].SetInt64(0)
+	t.pool.Put(data)
+}
+
+func (t *sixIntPool) get() *[6]Int {
+	return t.pool.Get().(*[6]Int)
+}
+
+var sixIntP = sixIntPool{
+	sync.Pool{
+		New: func() any {
+			return &[6]Int{}
+		},
+	},
 }
 
 // lehmerGCD sets z to the greatest common divisor of a and b,
@@ -756,24 +869,25 @@ func euclidUpdate(A, B, Ua, Ub, q, r, s, t *Int, extended bool) {
 // The cosequences are updated according to Algorithm 10.45 from
 // Cohen et al. "Handbook of Elliptic and Hyperelliptic Curve Cryptography" pp 192.
 func (z *Int) lehmerGCD(x, y, a, b *Int) *Int {
-	var A, B, Ua, Ub *Int
+	// recycle limbs to reduce allocations.
+	data := sixIntP.get()
+	defer sixIntP.put(data)
 
-	A = new(Int).Abs(a)
-	B = new(Int).Abs(b)
+	var A, B, Ua, Ub *Int = &data[0], &data[1], &data[2], &data[3]
+
+	A.Abs(a)
+	B.Abs(b)
 
 	extended := x != nil || y != nil
 
 	if extended {
 		// Ua (Ub) tracks how many times input a has been accumulated into A (B).
-		Ua = new(Int).SetInt64(1)
-		Ub = new(Int)
+		Ua.SetInt64(1)
 	}
 
 	// temp variables for multiprecision update
-	q := new(Int)
-	r := new(Int)
-	s := new(Int)
-	t := new(Int)
+	q := &data[4]
+	r := &data[5]
 
 	// ensure A >= B
 	if A.abs.cmp(B.abs) < 0 {
@@ -791,18 +905,18 @@ func (z *Int) lehmerGCD(x, y, a, b *Int) *Int {
 			// Simulate the effect of the single-precision steps using the cosequences.
 			// A = u0*A + v0*B
 			// B = u1*A + v1*B
-			lehmerUpdate(A, B, q, r, s, t, u0, u1, v0, v1, even)
+			lehmerUpdate(A, B, q, r, u0, u1, v0, v1, even)
 
 			if extended {
 				// Ua = u0*Ua + v0*Ub
 				// Ub = u1*Ua + v1*Ub
-				lehmerUpdate(Ua, Ub, q, r, s, t, u0, u1, v0, v1, even)
+				lehmerUpdate(Ua, Ub, q, r, u0, u1, v0, v1, even)
 			}
 
 		} else {
 			// Single-digit calculations failed to simulate any quotients.
 			// Do a standard Euclidean step.
-			euclidUpdate(A, B, Ua, Ub, q, r, s, t, extended)
+			A, B, r, Ua, Ub = euclidUpdate(A, B, Ua, Ub, q, r, extended)
 		}
 	}
 
@@ -810,7 +924,7 @@ func (z *Int) lehmerGCD(x, y, a, b *Int) *Int {
 		// extended Euclidean algorithm base case if B is a single Word
 		if len(A.abs) > 1 {
 			// A is longer than a single Word, so one update is needed.
-			euclidUpdate(A, B, Ua, Ub, q, r, s, t, extended)
+			A, B, r, Ua, Ub = euclidUpdate(A, B, Ua, Ub, q, r, extended)
 		}
 		if len(B.abs) > 0 {
 			// A and B are both a single Word.
@@ -828,15 +942,9 @@ func (z *Int) lehmerGCD(x, y, a, b *Int) *Int {
 					even = !even
 				}
 
-				t.abs = t.abs.setWord(ua)
-				s.abs = s.abs.setWord(va)
-				t.neg = !even
-				s.neg = even
-
-				t.Mul(Ua, t)
-				s.Mul(Ub, s)
-
-				Ua.Add(t, s)
+				mulW(Ua, Ua, !even, ua)
+				mulW(Ub, Ub, even, va)
+				Ua.Add(Ua, Ub)
 			} else {
 				for bWord != 0 {
 					aWord, bWord = bWord, aWord%bWord
@@ -863,13 +971,13 @@ func (z *Int) lehmerGCD(x, y, a, b *Int) *Int {
 	}
 
 	if x != nil {
-		*x = *Ua
+		x.Set(Ua)
 		if negA {
 			x.neg = !x.neg
 		}
 	}
 
-	*z = *A
+	z.Set(A)
 
 	return z
 }
@@ -890,6 +998,30 @@ func (z *Int) Rand(rnd *rand.Rand, n *Int) *Int {
 	return z
 }
 
+// twoIntPool is used to reduce allocation of limbs used in temporary integers
+// used to calculate ModInverse.
+type twoIntPool struct {
+	pool sync.Pool
+}
+
+func (t *twoIntPool) put(data *[2]Int) {
+	data[0].SetInt64(0)
+	data[1].SetInt64(0)
+	t.pool.Put(data)
+}
+
+func (t *twoIntPool) get() *[2]Int {
+	return t.pool.Get().(*[2]Int)
+}
+
+var twoIntP = twoIntPool{
+	sync.Pool{
+		New: func() any {
+			return &[2]Int{}
+		},
+	},
+}
+
 // ModInverse sets z to the multiplicative inverse of g in the ring ℤ/nℤ
 // and returns z. If g and n are not relatively prime, g has no multiplicative
 // inverse in the ring ℤ/nℤ.  In this case, z is unchanged and the return value
@@ -904,8 +1036,13 @@ func (z *Int) ModInverse(g, n *Int) *Int {
 		var g2 Int
 		g = g2.Mod(g, n)
 	}
-	var d, x Int
-	d.GCD(&x, nil, g, n)
+
+	// recycle limbs to reduce allocations.
+	data := twoIntP.get()
+	defer twoIntP.put(data)
+
+	var d, x *Int = &data[0], &data[1]
+	d.GCD(x, nil, g, n)
 
 	// if and only if d==1, g and n are relatively prime
 	if d.Cmp(intOne) != 0 {
@@ -915,10 +1052,11 @@ func (z *Int) ModInverse(g, n *Int) *Int {
 	// x and y are such that g*x + n*y = 1, therefore x is the inverse element,
 	// but it may be negative, so convert to the range 0 <= z < |n|
 	if x.neg {
-		z.Add(&x, n)
+		z.Add(x, n)
 	} else {
-		z.Set(&x)
+		z.Set(x)
 	}
+
 	return z
 }
 
@@ -1104,7 +1242,7 @@ func (z *Int) ModSqrt(x, p *Int) *Int {
 
 // Lsh sets z = x << n and returns z.
 func (z *Int) Lsh(x *Int, n uint) *Int {
-	z.abs = z.abs.shl(x.abs, n)
+	z.abs = z.abs.lsh(x.abs, n)
 	z.neg = x.neg
 	return z
 }
@@ -1114,13 +1252,13 @@ func (z *Int) Rsh(x *Int, n uint) *Int {
 	if x.neg {
 		// (-x) >> s == ^(x-1) >> s == ^((x-1) >> s) == -(((x-1) >> s) + 1)
 		t := z.abs.sub(x.abs, natOne) // no underflow because |x| > 0
-		t = t.shr(t, n)
+		t = t.rsh(t, n)
 		z.abs = t.add(t, natOne)
 		z.neg = true // z cannot be zero if x is negative
 		return z
 	}
 
-	z.abs = z.abs.shr(x.abs, n)
+	z.abs = z.abs.rsh(x.abs, n)
 	z.neg = false
 	return z
 }
@@ -1312,6 +1450,6 @@ func (z *Int) Sqrt(x *Int) *Int {
 		panic("square root of negative number")
 	}
 	z.neg = false
-	z.abs = z.abs.sqrt(x.abs)
+	z.abs = z.abs.sqrt(nil, x.abs)
 	return z
 }

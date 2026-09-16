@@ -30,9 +30,7 @@ func toJson(v any) string {
 
 func testLookup(t *testing.T, fn func(*testing.T, *Resolver, string)) {
 	for _, def := range []bool{true, false} {
-		def := def
 		for _, server := range nslookupTestServers {
-			server := server
 			var name string
 			if def {
 				name = "default/"
@@ -144,7 +142,7 @@ func TestNSLookupTXT(t *testing.T) {
 		}
 		slices.Sort(expected)
 		slices.Sort(txt)
-		if !reflect.DeepEqual(expected, txt) {
+		if !slices.Equal(expected, txt) {
 			t.Errorf("different results %s:\texp:%v\tgot:%v", server, toJson(expected), toJson(txt))
 		}
 	})
@@ -170,7 +168,7 @@ func TestLookupLocalPTR(t *testing.T) {
 	}
 	slices.Sort(expected)
 	slices.Sort(names)
-	if !reflect.DeepEqual(expected, names) {
+	if !slices.Equal(expected, names) {
 		t.Errorf("different results %s:\texp:%v\tgot:%v", addr, toJson(expected), toJson(names))
 	}
 }
@@ -201,7 +199,7 @@ func TestLookupPTR(t *testing.T) {
 		}
 		slices.Sort(expected)
 		slices.Sort(names)
-		if !reflect.DeepEqual(expected, names) {
+		if !slices.Equal(expected, names) {
 			t.Errorf("different results %s:\texp:%v\tgot:%v", addr, toJson(expected), toJson(names))
 		}
 	}

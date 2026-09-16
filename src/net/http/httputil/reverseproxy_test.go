@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
@@ -22,11 +23,13 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -35,6 +38,36 @@ const fakeHopHeader = "X-Fake-Hop-Header-For-Test"
 func init() {
 	inOurTests = true
 	hopHeaders = append(hopHeaders, fakeHopHeader)
+}
+
+type proxyTest struct {
+	backend         *httptest.Server
+	frontend        *httptest.Server
+	backendHandler  http.HandlerFunc
+	frontendHandler http.HandlerFunc
+	client          *http.Client
+	proxy           *ReverseProxy
+}
+
+func newReverseProxyTest(t *testing.T) *proxyTest {
+	test := &proxyTest{}
+	test.backend = httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if test.backendHandler != nil {
+			test.backendHandler(w, req)
+		}
+	}))
+	test.frontend = httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if test.frontendHandler != nil {
+			test.frontendHandler(w, req)
+			return
+		}
+		test.proxy.ServeHTTP(w, req)
+	}))
+	test.proxy = &ReverseProxy{
+		Transport: test.backend.Client().Transport,
+	}
+	test.client = test.frontend.Client()
+	return test
 }
 
 func TestReverseProxy(t *testing.T) {
@@ -137,6 +170,7 @@ func TestReverseProxy(t *testing.T) {
 	if g, e := res.Trailer.Get("X-Unannounced-Trailer"), "unannounced_trailer_value"; g != e {
 		t.Errorf("Trailer(X-Unannounced-Trailer) = %q ; want %q", g, e)
 	}
+	res.Body.Close()
 
 	// Test that a backend failing to be reached or one which doesn't return
 	// a response results in a StatusBadGateway.
@@ -196,7 +230,7 @@ func TestReverseProxyStripHeadersPresentInConnection(t *testing.T) {
 		c := r.Header["Connection"]
 		var cf []string
 		for _, f := range c {
-			for _, sf := range strings.Split(f, ",") {
+			for sf := range strings.SplitSeq(f, ",") {
 				if sf = strings.TrimSpace(sf); sf != "" {
 					cf = append(cf, sf)
 				}
@@ -205,7 +239,7 @@ func TestReverseProxyStripHeadersPresentInConnection(t *testing.T) {
 		slices.Sort(cf)
 		expectedValues := []string{"Upgrade", someConnHeader, fakeConnectionToken}
 		slices.Sort(expectedValues)
-		if !reflect.DeepEqual(cf, expectedValues) {
+		if !slices.Equal(cf, expectedValues) {
 			t.Errorf("handler modified header %q = %q; want %q", "Connection", cf, expectedValues)
 		}
 	}))
@@ -328,6 +362,7 @@ func TestXForwardedFor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
+	defer res.Body.Close()
 	if g, e := res.StatusCode, backendStatus; g != e {
 		t.Errorf("got res.StatusCode %d; expected %d", g, e)
 	}
@@ -614,10 +649,11 @@ func TestReverseProxyCancellation(t *testing.T) {
 	defer frontend.Close()
 	frontendClient := frontend.Client()
 
-	getReq, _ := http.NewRequest("GET", frontend.URL, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	getReq, _ := http.NewRequestWithContext(ctx, "GET", frontend.URL, nil)
 	go func() {
 		<-reqInFlight
-		frontendClient.Transport.(*http.Transport).CancelRequest(getReq)
+		cancel()
 	}()
 	res, err := frontendClient.Do(getReq)
 	if res != nil {
@@ -765,7 +801,7 @@ func TestReverseProxyGetPutBuffer(t *testing.T) {
 	wantLog := []string{"getBuf", "putBuf-" + strconv.Itoa(size)}
 	mu.Lock()
 	defer mu.Unlock()
-	if !reflect.DeepEqual(log, wantLog) {
+	if !slices.Equal(log, wantLog) {
 		t.Errorf("Log events = %q; want %q", log, wantLog)
 	}
 }
@@ -801,6 +837,7 @@ func TestReverseProxy_Post(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
+	defer res.Body.Close()
 	if g, e := res.StatusCode, backendStatus; g != e {
 		t.Errorf("got res.StatusCode %d; expected %d", g, e)
 	}
@@ -1548,6 +1585,245 @@ func TestReverseProxyWebSocketCancellation(t *testing.T) {
 	}
 }
 
+func TestReverseProxyWebSocketHalfTCP(t *testing.T) {
+	// Issue #35892: support TCP half-close when HTTP is upgraded in the ReverseProxy.
+	// Specifically testing:
+	// - the communication through the reverse proxy when the client or server closes
+	//   either the read or write streams
+	// - that closing the write stream is propagated through the proxy and results in reading
+	//   EOF at the other end of the connection
+
+	switch runtime.GOOS {
+	case "plan9":
+		t.Skipf("not supported on %s", runtime.GOOS)
+	}
+
+	mustRead := func(t *testing.T, conn *net.TCPConn, msg string) {
+		b := make([]byte, len(msg))
+		if _, err := conn.Read(b); err != nil {
+			t.Errorf("failed to read: %v", err)
+		}
+
+		if got, want := string(b), msg; got != want {
+			t.Errorf("got %#q, want %#q", got, want)
+		}
+	}
+
+	mustReadError := func(t *testing.T, conn *net.TCPConn, e error) {
+		b := make([]byte, 1)
+		if _, err := conn.Read(b); !errors.Is(err, e) {
+			t.Errorf("failed to read error: %v", err)
+		}
+	}
+
+	mustWrite := func(t *testing.T, conn *net.TCPConn, msg string) {
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Errorf("failed to write: %v", err)
+		}
+	}
+
+	mustCloseRead := func(t *testing.T, conn *net.TCPConn) {
+		if err := conn.CloseRead(); err != nil {
+			t.Errorf("failed to CloseRead: %v", err)
+		}
+	}
+
+	mustCloseWrite := func(t *testing.T, conn *net.TCPConn) {
+		if err := conn.CloseWrite(); err != nil {
+			t.Errorf("failed to CloseWrite: %v", err)
+		}
+	}
+
+	tests := map[string]func(t *testing.T, cli, srv *net.TCPConn){
+		"server close read": func(t *testing.T, cli, srv *net.TCPConn) {
+			mustCloseRead(t, srv)
+			mustWrite(t, srv, "server sends")
+			mustRead(t, cli, "server sends")
+		},
+		"server close write": func(t *testing.T, cli, srv *net.TCPConn) {
+			mustCloseWrite(t, srv)
+			mustWrite(t, cli, "client sends")
+			mustRead(t, srv, "client sends")
+			mustReadError(t, cli, io.EOF)
+		},
+		"client close read": func(t *testing.T, cli, srv *net.TCPConn) {
+			mustCloseRead(t, cli)
+			mustWrite(t, cli, "client sends")
+			mustRead(t, srv, "client sends")
+		},
+		"client close write": func(t *testing.T, cli, srv *net.TCPConn) {
+			mustCloseWrite(t, cli)
+			mustWrite(t, srv, "server sends")
+			mustRead(t, cli, "server sends")
+			mustReadError(t, srv, io.EOF)
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			var srv *net.TCPConn
+
+			backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if g, ws := upgradeType(r.Header), "websocket"; g != ws {
+					t.Fatalf("Unexpected upgrade type %q, want %q", g, ws)
+				}
+
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					conn.Close()
+					t.Fatalf("hijack failed: %v", err)
+				}
+
+				var ok bool
+				if srv, ok = conn.(*net.TCPConn); !ok {
+					conn.Close()
+					t.Fatal("conn is not a TCPConn")
+				}
+
+				upgradeMsg := "HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: WebSocket\r\n\r\n"
+				if _, err := io.WriteString(srv, upgradeMsg); err != nil {
+					srv.Close()
+					t.Fatalf("backend upgrade failed: %v", err)
+				}
+			}))
+			defer backendServer.Close()
+
+			backendURL, _ := url.Parse(backendServer.URL)
+			rproxy := NewSingleHostReverseProxy(backendURL)
+			rproxy.ErrorLog = log.New(io.Discard, "", 0) // quiet for tests
+			frontendProxy := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				rproxy.ServeHTTP(rw, req)
+			}))
+			defer frontendProxy.Close()
+
+			frontendURL, _ := url.Parse(frontendProxy.URL)
+			addr, err := net.ResolveTCPAddr("tcp", frontendURL.Host)
+			if err != nil {
+				t.Fatalf("failed to resolve TCP address: %v", err)
+			}
+			cli, err := net.DialTCP("tcp", nil, addr)
+			if err != nil {
+				t.Fatalf("failed to dial TCP address: %v", err)
+			}
+			defer cli.Close()
+
+			req, _ := http.NewRequest("GET", frontendProxy.URL, nil)
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+			if err := req.Write(cli); err != nil {
+				t.Fatalf("failed to write request: %v", err)
+			}
+
+			br := bufio.NewReader(cli)
+			resp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
+			if err != nil {
+				t.Fatalf("failed to read response: %v", err)
+			}
+			if resp.StatusCode != 101 {
+				t.Fatalf("status code not 101: %v", resp.StatusCode)
+			}
+			if strings.ToLower(resp.Header.Get("Upgrade")) != "websocket" ||
+				strings.ToLower(resp.Header.Get("Connection")) != "upgrade" {
+				t.Fatalf("frontend upgrade failed")
+			}
+			defer srv.Close()
+
+			test(t, cli, srv)
+		})
+	}
+}
+
+func TestReverseProxyUpgradeNoCloseWrite(t *testing.T) {
+	// The backend hijacks the connection,
+	// reads all data from the client,
+	// and returns.
+	backendDone := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "upgrade")
+		w.Header().Set("Upgrade", "u")
+		w.WriteHeader(101)
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("Hijack: %v", err)
+		}
+		io.Copy(io.Discard, conn)
+		close(backendDone)
+	}))
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The proxy includes a ModifyResponse function which replaces the response body
+	// with its own wrapper, dropping the original body's CloseWrite method.
+	proxyHandler := NewSingleHostReverseProxy(backendURL)
+	proxyHandler.ModifyResponse = func(resp *http.Response) error {
+		type readWriteCloserOnly struct {
+			io.ReadWriteCloser
+		}
+		resp.Body = readWriteCloserOnly{resp.Body.(io.ReadWriteCloser)}
+		return nil
+	}
+	frontend := httptest.NewServer(proxyHandler)
+	defer frontend.Close()
+
+	// The client sends a request and closes the connection.
+	req, _ := http.NewRequest("GET", frontend.URL, nil)
+	req.Header.Set("Connection", "upgrade")
+	req.Header.Set("Upgrade", "u")
+	resp, err := frontend.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// We expect that the client's closure of the connection is propagated to the backend.
+	<-backendDone
+}
+
+func TestReverseProxyUpgradeH2C(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h, ok := r.Header["Connection"]; ok {
+			if slices.Equal(r.Header["Upgrade"], []string{"websocket"}) {
+				return
+			}
+			t.Errorf("unexpected Connection header: %q", h)
+		}
+		if h, ok := r.Header["Upgrade"]; ok {
+			t.Errorf("unexpected Upgrade header: %q", h)
+		}
+	}))
+	defer backendServer.Close()
+
+	backURL, _ := url.Parse(backendServer.URL)
+	rproxy := NewSingleHostReverseProxy(backURL)
+	rproxy.ErrorLog = log.New(io.Discard, "", 0) // quiet for tests
+
+	frontendProxy := httptest.NewServer(rproxy)
+	defer frontendProxy.Close()
+
+	for _, upgrade := range [][]string{
+		{"h2c"},
+		{" h2c "},
+		{"H2C"},
+		{"websocket, h2c"},
+		{"websocket", "h2c"},
+	} {
+		req, _ := http.NewRequest("GET", frontendProxy.URL, nil)
+		req.Header.Set("Connection", "Upgrade")
+		req.Header["Upgrade"] = upgrade
+
+		res, err := frontendProxy.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != 200 {
+			t.Fatalf("status = %v; want 200", res.Status)
+		}
+	}
+}
+
 func TestUnannouncedTrailer(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1571,7 +1847,7 @@ func TestUnannouncedTrailer(t *testing.T) {
 	}
 
 	io.ReadAll(res.Body)
-
+	res.Body.Close()
 	if g, w := res.Trailer.Get("X-Unannounced-Trailer"), "unannounced_trailer_value"; g != w {
 		t.Errorf("Trailer(X-Unannounced-Trailer) = %q; want %q", g, w)
 	}
@@ -1886,6 +2162,12 @@ func testReverseProxyQueryParameterSmuggling(t *testing.T, wantCleanQuery bool, 
 	}, {
 		rawQuery:   "a=1&a=%zz&b=3",
 		cleanQuery: "a=1&b=3",
+	}, {
+		rawQuery:   "a=%zz",
+		cleanQuery: "",
+	}, {
+		rawQuery:   strings.Repeat("a=1&", 10000) + "a=1",
+		cleanQuery: "",
 	}} {
 		res, err := frontend.Client().Get(frontend.URL + "?" + test.rawQuery)
 		if err != nil {
@@ -1903,10 +2185,56 @@ func testReverseProxyQueryParameterSmuggling(t *testing.T, wantCleanQuery bool, 
 	}
 }
 
+// Issue #72954: We should not call WriteHeader on a ResponseWriter after hijacking
+// the connection.
+func TestReverseProxyHijackCopyError(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Upgrade", "someproto")
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyHandler := &ReverseProxy{
+		Rewrite: func(r *ProxyRequest) {
+			r.SetURL(backendURL)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			resp.Body = &testReadWriteCloser{
+				read: func([]byte) (int, error) {
+					return 0, errors.New("read error")
+				},
+			}
+			return nil
+		},
+	}
+
+	hijacked := false
+	rw := &testResponseWriter{
+		writeHeader: func(statusCode int) {
+			if hijacked {
+				t.Errorf("WriteHeader(%v) called after Hijack", statusCode)
+			}
+		},
+		hijack: func() (net.Conn, *bufio.ReadWriter, error) {
+			hijacked = true
+			cli, srv := net.Pipe()
+			go io.Copy(io.Discard, cli)
+			return srv, bufio.NewReadWriter(bufio.NewReader(srv), bufio.NewWriter(srv)), nil
+		},
+	}
+	req, _ := http.NewRequest("GET", "http://example.tld/", nil)
+	req.Header.Set("Upgrade", "someproto")
+	proxyHandler.ServeHTTP(rw, req)
+}
+
 type testResponseWriter struct {
 	h           http.Header
 	writeHeader func(int)
 	write       func([]byte) (int, error)
+	hijack      func() (net.Conn, *bufio.ReadWriter, error)
 }
 
 func (rw *testResponseWriter) Header() http.Header {
@@ -1927,4 +2255,94 @@ func (rw *testResponseWriter) Write(p []byte) (int, error) {
 		return rw.write(p)
 	}
 	return len(p), nil
+}
+
+func (rw *testResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if rw.hijack != nil {
+		return rw.hijack()
+	}
+	return nil, nil, errors.ErrUnsupported
+}
+
+type testReadWriteCloser struct {
+	read  func([]byte) (int, error)
+	write func([]byte) (int, error)
+	close func() error
+}
+
+func (rc *testReadWriteCloser) Read(p []byte) (int, error) {
+	if rc.read != nil {
+		return rc.read(p)
+	}
+	return 0, io.EOF
+}
+
+func (rc *testReadWriteCloser) Write(p []byte) (int, error) {
+	if rc.write != nil {
+		return rc.write(p)
+	}
+	return len(p), nil
+}
+
+func (rc *testReadWriteCloser) Close() error {
+	if rc.close != nil {
+		return rc.close()
+	}
+	return nil
+}
+
+func TestReverseProxy1xx(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		test := newReverseProxyTest(t)
+		test.backendHandler = func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("X-Backend", "backend")
+			w.WriteHeader(103)
+		}
+		test.proxy.Rewrite = func(r *ProxyRequest) {
+			backendURL := url.MustParse("http://backend.tld/")
+			r.SetURL(backendURL)
+		}
+		test.frontendHandler = func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("X-Frontend", "frontend")
+			test.proxy.ServeHTTP(w, req)
+		}
+
+		var got1xxCode int
+		var got1xxHeader http.Header
+		trace := &httptrace.ClientTrace{
+			Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
+				got1xxCode = code
+				got1xxHeader = http.Header(header).Clone()
+				return nil
+			},
+		}
+		ctx := httptrace.WithClientTrace(context.Background(), trace)
+		req, err := http.NewRequestWithContext(ctx, "GET", "http://example.tld/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := test.client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		if got, want := got1xxCode, 103; got != want {
+			t.Errorf("got 1xx code %v, want %v", got, want)
+		}
+		if got, want := got1xxHeader.Get("X-Backend"), "backend"; got != want {
+			t.Errorf("got 1xx X-Backend header %q, want %q", got, want)
+		}
+		if got, want := got1xxHeader.Get("X-Frontend"), "frontend"; got != want {
+			t.Errorf("got 1xx X-Frontend header %q, want %q", got, want)
+		}
+
+		if got, want := resp.Header.Get("X-Backend"), "backend"; got != want {
+			t.Errorf("got 2xx X-Backend header %q, want %q", got, want)
+		}
+		if got, want := resp.Header.Get("X-Frontend"), "frontend"; got != want {
+			t.Errorf("got 2xx X-Frontend header %q, want %q", got, want)
+		}
+	})
 }

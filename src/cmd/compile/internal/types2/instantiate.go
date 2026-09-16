@@ -21,7 +21,7 @@ type genericType interface {
 }
 
 // Instantiate instantiates the type orig with the given type arguments targs.
-// orig must be an *Alias, *Named, or *Signature type. If there is no error,
+// orig must be a generic *Alias, *Named, or *Signature type. If there is no error,
 // the resulting Type is an instantiated type of the same kind (*Alias, *Named
 // or *Signature, respectively).
 //
@@ -36,30 +36,37 @@ type genericType interface {
 // signatures will yield different instances. The use of a shared context does
 // not guarantee that identical instances are deduplicated in all cases.
 //
-// If validate is set, Instantiate verifies that the number of type arguments
-// and parameters match, and that the type arguments satisfy their respective
-// type constraints. If verification fails, the resulting error may wrap an
-// *ArgumentError indicating which type argument did not satisfy its type parameter
-// constraint, and why.
+// If validate is set, Instantiate verifies that the type orig is in fact generic,
+// that the number of type arguments and parameters match, and that the type arguments
+// satisfy their respective type constraints.
+// If verification fails, the resulting error may wrap an *ArgumentError indicating
+// which type argument did not satisfy its type parameter constraint, and why.
 //
-// If validate is not set, Instantiate does not verify the type argument count
-// or whether the type arguments satisfy their constraints. Instantiate is
-// guaranteed to not return an error, but may panic. Specifically, for
-// *Signature types, Instantiate will panic immediately if the type argument
+// If validate is not set, Instantiate does not check if orig is generic, verify the
+// type argument count, or check whether the type arguments satisfy their constraints.
+// Instantiate is guaranteed to not return an error, but may panic. Specifically,
+// for *Signature types, Instantiate will panic immediately if the type argument
 // count is incorrect; for *Named types, a panic may occur later inside the
 // *Named API.
 func Instantiate(ctxt *Context, orig Type, targs []Type, validate bool) (Type, error) {
-	assert(len(targs) > 0)
 	if ctxt == nil {
 		ctxt = NewContext()
 	}
-	orig_ := orig.(genericType) // signature of Instantiate must not change for backward-compatibility
+	orig_, ok := orig.(genericType) // signature of Instantiate must not change for backward-compatibility
+	if !ok {
+		panic(sprintf(nil, false, "cannot instantiate non-generic %s: expected *Named, *Alias, or *Signature", orig))
+	}
+	if len(targs) == 0 {
+		panic(sprintf(nil, false, "cannot instantiate %s: empty type argument list", orig))
+	}
 
 	if validate {
 		tparams := orig_.TypeParams().list()
-		assert(len(tparams) > 0)
+		if len(tparams) == 0 {
+			return nil, fmt.Errorf("cannot instantiate non-generic %s: has no type parameters", orig)
+		}
 		if len(targs) != len(tparams) {
-			return nil, fmt.Errorf("got %d type arguments but %s has %d type parameters", len(targs), orig, len(tparams))
+			return nil, fmt.Errorf("cannot instantiate %s: got %d type arguments but have %d type parameters", orig, len(targs), len(tparams))
 		}
 		if i, err := (*Checker)(nil).verify(nopos, tparams, targs, ctxt); err != nil {
 			return nil, &ArgumentError{i, err}
@@ -73,7 +80,8 @@ func Instantiate(ctxt *Context, orig Type, targs []Type, validate bool) (Type, e
 // instance instantiates the given original (generic) function or type with the
 // provided type arguments and returns the resulting instance. If an identical
 // instance exists already in the given contexts, it returns that instance,
-// otherwise it creates a new one.
+// otherwise it creates a new one. If there is an error (such as wrong number
+// of type arguments), the result is Typ[Invalid].
 //
 // If expanding is non-nil, it is the Named instance type currently being
 // expanded. If ctxt is non-nil, it is the context associated with the current
@@ -81,6 +89,8 @@ func Instantiate(ctxt *Context, orig Type, targs []Type, validate bool) (Type, e
 // must be non-nil.
 //
 // For Named types the resulting instance may be unexpanded.
+//
+// check may be nil (when not type-checking syntax); pos is used only if check is non-nil.
 func (check *Checker) instance(pos syntax.Pos, orig genericType, targs []Type, expanding *Named, ctxt *Context) (res Type) {
 	// The order of the contexts below matters: we always prefer instances in the
 	// expanding instance context in order to preserve reference cycles.
@@ -126,22 +136,28 @@ func (check *Checker) instance(pos syntax.Pos, orig genericType, targs []Type, e
 		res = check.newNamedInstance(pos, orig, targs, expanding) // substituted lazily
 
 	case *Alias:
-		// TODO(gri) is this correct?
-		assert(expanding == nil) // Alias instances cannot be reached from Named types
-
+		// verify type parameter count (see go.dev/issue/71198 for a test case)
 		tparams := orig.TypeParams()
-		// TODO(gri) investigate if this is needed (type argument and parameter count seem to be correct here)
-		if !check.validateTArgLen(pos, orig.String(), tparams.Len(), len(targs)) {
+		if !check.validateTArgLen(pos, orig.obj.Name(), tparams.Len(), len(targs)) {
+			// TODO(gri) Consider returning a valid alias instance with invalid
+			//           underlying (aliased) type to match behavior of *Named
+			//           types. Then this function will never return an invalid
+			//           result.
 			return Typ[Invalid]
 		}
 		if tparams.Len() == 0 {
 			return orig // nothing to do (minor optimization)
 		}
 
-		return check.newAliasInstance(pos, orig, targs, ctxt)
+		res = check.newAliasInstance(pos, orig, targs, expanding, ctxt)
 
 	case *Signature:
 		assert(expanding == nil) // function instances cannot be reached from Named types
+		// Note that orig may be a generic method on a generic type. In that case, orig
+		// is an instantiated type. It will not have receiver type parameters, but will
+		// still have ordinary type parameters.
+		assert(orig.RecvTypeParams() == nil)
+		assert(orig.TypeParams() != nil)
 
 		tparams := orig.TypeParams()
 		// TODO(gri) investigate if this is needed (type argument and parameter count seem to be correct here)
@@ -196,6 +212,7 @@ func (check *Checker) validateTArgLen(pos syntax.Pos, name string, want, got int
 	panic(fmt.Sprintf("%v: %s", pos, msg))
 }
 
+// check may be nil; pos is used only if check is non-nil.
 func (check *Checker) verify(pos syntax.Pos, tparams []*TypeParam, targs []Type, ctxt *Context) (int, error) {
 	smap := makeSubstMap(tparams, targs)
 	for i, tpar := range tparams {
@@ -207,7 +224,7 @@ func (check *Checker) verify(pos syntax.Pos, tparams []*TypeParam, targs []Type,
 		// the parameterized type.
 		bound := check.subst(pos, tpar.bound, smap, nil, ctxt)
 		var cause string
-		if !check.implements(pos, targs[i], bound, true, &cause) {
+		if !check.implements(targs[i], bound, true, &cause) {
 			return i, errors.New(cause)
 		}
 	}
@@ -220,13 +237,13 @@ func (check *Checker) verify(pos syntax.Pos, tparams []*TypeParam, targs []Type,
 //
 // If the provided cause is non-nil, it may be set to an error string
 // explaining why V does not implement (or satisfy, for constraints) T.
-func (check *Checker) implements(pos syntax.Pos, V, T Type, constraint bool, cause *string) bool {
-	Vu := under(V)
-	Tu := under(T)
+func (check *Checker) implements(V, T Type, constraint bool, cause *string) bool {
+	Vu := V.Underlying()
+	Tu := T.Underlying()
 	if !isValid(Vu) || !isValid(Tu) {
 		return true // avoid follow-on errors
 	}
-	if p, _ := Vu.(*Pointer); p != nil && !isValid(under(p.base)) {
+	if p, _ := Vu.(*Pointer); p != nil && !isValid(p.base.Underlying()) {
 		return true // avoid follow-on errors (see go.dev/issue/49541 for an example)
 	}
 
@@ -240,7 +257,7 @@ func (check *Checker) implements(pos syntax.Pos, V, T Type, constraint bool, cau
 		if cause != nil {
 			var detail string
 			if isInterfacePtr(Tu) {
-				detail = check.sprintf("type %s is pointer to interface, not interface", T)
+				detail = check.interfacePtrError(T)
 			} else {
 				detail = check.sprintf("%s is not an interface", T)
 			}
@@ -272,7 +289,7 @@ func (check *Checker) implements(pos syntax.Pos, V, T Type, constraint bool, cau
 	}
 
 	// V must implement T's methods, if any.
-	if m, _ := check.missingMethod(V, T, true, Identical, cause); m != nil /* !Implements(V, T) */ {
+	if !check.hasAllMethods(V, T, true, Identical, cause) /* !Implements(V, T) */ {
 		if cause != nil {
 			*cause = check.sprintf("%s does not %s %s %s", V, verb, T, *cause)
 		}
@@ -286,14 +303,14 @@ func (check *Checker) implements(pos syntax.Pos, V, T Type, constraint bool, cau
 		}
 		// If T is comparable, V must be comparable.
 		// If V is strictly comparable, we're done.
-		if comparable(V, false /* strict comparability */, nil, nil) {
+		if comparableType(V, false /* strict comparability */, nil) == nil {
 			return true
 		}
 		// For constraint satisfaction, use dynamic (spec) comparability
 		// so that ordinary, non-type parameter interfaces implement comparable.
-		if constraint && comparable(V, true /* spec comparability */, nil, nil) {
+		if constraint && comparableType(V, true /* spec comparability */, nil) == nil {
 			// V is comparable if we are at Go 1.20 or higher.
-			if check == nil || check.allowVersion(atPos(pos), go1_20) { // atPos needed so that go/types generate passes
+			if check == nil || check.allowVersion(go1_20) {
 				return true
 			}
 			if cause != nil {
@@ -334,7 +351,7 @@ func (check *Checker) implements(pos syntax.Pos, V, T Type, constraint bool, cau
 			// If V ∉ t.typ but V ∈ ~t.typ then remember this type
 			// so we can suggest it as an alternative in the error
 			// message.
-			if alt == nil && !t.tilde && Identical(t.typ, under(t.typ)) {
+			if alt == nil && !t.tilde && Identical(t.typ, t.typ.Underlying()) {
 				tt := *t
 				tt.tilde = true
 				if tt.includes(V) {

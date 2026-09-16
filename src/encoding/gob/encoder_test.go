@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"reflect"
 	"slices"
@@ -58,6 +59,24 @@ func TestBasicEncoderDecoder(t *testing.T) {
 	}
 }
 
+func TestEncodeNilInterfaceReusesEncoderState(t *testing.T) {
+	var value any
+	iv := reflect.ValueOf(&value).Elem()
+	enc := NewEncoder(io.Discard)
+	b := new(encBuffer)
+
+	enc.encodeInterface(b, iv)
+	state := enc.freeList
+	if state == nil {
+		t.Fatal("nil interface encoding did not return encoderState to free list")
+	}
+
+	enc.encodeInterface(b, iv)
+	if enc.freeList != state {
+		t.Fatal("nil interface encoding did not reuse encoderState")
+	}
+}
+
 func TestEncodeIntSlice(t *testing.T) {
 
 	s8 := []int8{1, 5, 12, 22, 35, 51, 70, 92, 117}
@@ -74,7 +93,7 @@ func TestEncodeIntSlice(t *testing.T) {
 		res := make([]int8, 9)
 		dec.Decode(&res)
 
-		if !reflect.DeepEqual(s8, res) {
+		if !slices.Equal(s8, res) {
 			t.Fatalf("EncodeIntSlice: expected %v, got %v", s8, res)
 		}
 	})
@@ -88,7 +107,7 @@ func TestEncodeIntSlice(t *testing.T) {
 		res := make([]int16, 9)
 		dec.Decode(&res)
 
-		if !reflect.DeepEqual(s16, res) {
+		if !slices.Equal(s16, res) {
 			t.Fatalf("EncodeIntSlice: expected %v, got %v", s16, res)
 		}
 	})
@@ -102,7 +121,7 @@ func TestEncodeIntSlice(t *testing.T) {
 		res := make([]int32, 9)
 		dec.Decode(&res)
 
-		if !reflect.DeepEqual(s32, res) {
+		if !slices.Equal(s32, res) {
 			t.Fatalf("EncodeIntSlice: expected %v, got %v", s32, res)
 		}
 	})
@@ -116,7 +135,7 @@ func TestEncodeIntSlice(t *testing.T) {
 		res := make([]int64, 9)
 		dec.Decode(&res)
 
-		if !reflect.DeepEqual(s64, res) {
+		if !slices.Equal(s64, res) {
 			t.Fatalf("EncodeIntSlice: expected %v, got %v", s64, res)
 		}
 	})
@@ -689,7 +708,7 @@ func TestMapBug1(t *testing.T) {
 	if err != nil {
 		t.Fatal("decode:", err)
 	}
-	if !reflect.DeepEqual(in, out) {
+	if !maps.Equal(in, out) {
 		t.Errorf("mismatch: %v %v", in, out)
 	}
 }
@@ -763,7 +782,7 @@ func TestSliceReusesMemory(t *testing.T) {
 		if err != nil {
 			t.Fatal("ints: decode:", err)
 		}
-		if !reflect.DeepEqual(x, y) {
+		if !slices.Equal(x, y) {
 			t.Errorf("ints: expected %q got %q\n", x, y)
 		}
 		if addr != &y[0] {
@@ -1199,7 +1218,7 @@ func TestMarshalFloatMap(t *testing.T) {
 
 	got := readMap(out)
 	want := readMap(in)
-	if !reflect.DeepEqual(got, want) {
+	if !slices.Equal(got, want) {
 		t.Fatalf("\nEncode: %v\nDecode: %v", want, got)
 	}
 }
@@ -1273,9 +1292,33 @@ func TestDecoderOverflow(t *testing.T) {
 		0x12, 0xff, 0xff, 0x2, 0x2, 0x20, 0x0, 0xf8, 0x7f, 0xff, 0xff, 0xff,
 		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x20, 0x20, 0x20, 0x20, 0x20,
 	}))
-	var r interface{}
+	var r any
 	err := dec.Decode(r)
 	if err == nil {
 		t.Fatalf("expected an error")
+	}
+}
+
+// Issue 79756.
+func TestLargeMap(t *testing.T) {
+	t.Parallel()
+	type array [8192]byte
+	const entries = 2500 // enough to allocate a smaller map
+	m := make(map[int16]array, entries)
+	for i := range entries {
+		m[int16(i)] = array{}
+	}
+	var b bytes.Buffer
+	enc := NewEncoder(&b)
+	if err := enc.Encode(m); err != nil {
+		t.Fatal(err)
+	}
+	dec := NewDecoder(&b)
+	m = nil
+	if err := dec.Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != entries {
+		t.Errorf("got %d entries, want %d", len(m), entries)
 	}
 }

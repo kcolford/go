@@ -314,9 +314,17 @@ func (s *state) walkIfOrWith(typ parse.NodeType, dot reflect.Value, pipe *parse.
 	}
 }
 
-// IsTrue reports whether the value is 'true', in the sense of not the zero of its type,
-// and whether the value has a meaningful truth value. This is the definition of
-// truth used by if and other such actions.
+// IsTrue reports whether the value is true, in the sense of being nonzero,
+// nonempty, or non-nil, and whether the value has a meaningful truth value.
+// This is the definition of truth used in "if" actions and elsewhere in
+// templates:
+//
+//   - A boolean value is true if it is true.
+//   - A numeric value is true if it is nonzero.
+//   - An array, map, slice, or string value is true if its length is
+//     greater than zero.
+//   - Any other value is true if it is non-nil; struct values are
+//     never nil, and therefore always true.
 func IsTrue(val any) (truth, ok bool) {
 	return isTrue(reflect.ValueOf(val))
 }
@@ -333,7 +341,7 @@ func isTrue(val reflect.Value) (truth, ok bool) {
 		truth = val.Bool()
 	case reflect.Complex64, reflect.Complex128:
 		truth = val.Complex() != 0
-	case reflect.Chan, reflect.Func, reflect.Pointer, reflect.Interface:
+	case reflect.Chan, reflect.Func, reflect.Pointer, reflect.UnsafePointer, reflect.Interface:
 		truth = !val.IsNil()
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		truth = val.Int() != 0
@@ -395,6 +403,22 @@ func (s *state) walkRange(dot reflect.Value, r *parse.RangeNode) {
 		s.walk(elem, r.List)
 	}
 	switch val.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if len(r.Pipe.Decl) > 1 {
+			s.errorf("can't use %v to iterate over more than one variable", val)
+			break
+		}
+		run := false
+		for v := range val.Seq() {
+			run = true
+			// Pass element as second value, as we do for channels.
+			oneIteration(reflect.Value{}, v)
+		}
+		if !run {
+			break
+		}
+		return
 	case reflect.Array, reflect.Slice:
 		if val.Len() == 0 {
 			break
@@ -434,6 +458,43 @@ func (s *state) walkRange(dot reflect.Value, r *parse.RangeNode) {
 		return
 	case reflect.Invalid:
 		break // An invalid value is likely a nil map, etc. and acts like an empty map.
+	case reflect.Func:
+		if val.Type().CanSeq() {
+			if len(r.Pipe.Decl) > 1 {
+				s.errorf("can't use %v iterate over more than one variable", val)
+				break
+			}
+			run := false
+			for v := range val.Seq() {
+				run = true
+				// Pass element as second value,
+				// as we do for channels.
+				oneIteration(reflect.Value{}, v)
+			}
+			if !run {
+				break
+			}
+			return
+		}
+		if val.Type().CanSeq2() {
+			run := false
+			for i, v := range val.Seq2() {
+				run = true
+				if len(r.Pipe.Decl) > 1 {
+					oneIteration(i, v)
+				} else {
+					// If there is only one range variable,
+					// oneIteration will use the
+					// second value.
+					oneIteration(reflect.Value{}, i)
+				}
+			}
+			if !run {
+				break
+			}
+			return
+		}
+		fallthrough
 	default:
 		s.errorf("range can't iterate over %v", val)
 	}
@@ -757,7 +818,7 @@ func (s *state) evalCall(dot, fun reflect.Value, isBuiltin bool, node parse.Node
 				return v
 			}
 		}
-		if final != missingVal {
+		if !final.Equal(missingVal) {
 			// The last argument to and/or is coming from
 			// the pipeline. We didn't short circuit on an earlier
 			// argument, so we are going to return this one.
@@ -803,7 +864,13 @@ func (s *state) evalCall(dot, fun reflect.Value, isBuiltin bool, node parse.Node
 	// Special case for the "call" builtin.
 	// Insert the name of the callee function as the first argument.
 	if isBuiltin && name == "call" {
-		calleeName := args[0].String()
+		var calleeName string
+		if len(args) == 0 {
+			// final must be present or we would have errored out above.
+			calleeName = final.String()
+		} else {
+			calleeName = args[0].String()
+		}
 		argv = append([]reflect.Value{reflect.ValueOf(calleeName)}, argv...)
 		fun = reflect.ValueOf(call)
 	}

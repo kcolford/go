@@ -23,15 +23,9 @@ func TestTBHelper(t *testing.T) {
 		return
 	}
 
-	testenv.MustHaveExec(t)
 	t.Parallel()
 
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cmd := testenv.Command(t, exe, "-test.run=^TestTBHelper$")
+	cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^TestTBHelper$")
 	cmd = testenv.CleanCmdEnv(cmd)
 	cmd.Env = append(cmd.Env, "GO_WANT_HELPER_PROCESS=1")
 	out, _ := cmd.CombinedOutput()
@@ -66,15 +60,9 @@ func TestTBHelperParallel(t *testing.T) {
 		return
 	}
 
-	testenv.MustHaveExec(t)
 	t.Parallel()
 
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cmd := testenv.Command(t, exe, "-test.run=^TestTBHelperParallel$")
+	cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^TestTBHelperParallel$")
 	cmd = testenv.CleanCmdEnv(cmd)
 	cmd.Env = append(cmd.Env, "GO_WANT_HELPER_PROCESS=1")
 	out, _ := cmd.CombinedOutput()
@@ -94,6 +82,28 @@ func TestTBHelperParallel(t *testing.T) {
 	want := "helperfuncs_test.go:24: parallel"
 	if got := strings.TrimSpace(lines[1]); got != want {
 		t.Errorf("got second output line %q; want %q", got, want)
+	}
+}
+
+// Issue 72794.
+func TestHelperRange(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") == "1" {
+		rangeHelperHelper(t)
+		return
+	}
+
+	t.Parallel()
+
+	cmd := testenv.Command(t, testenv.Executable(t), "-test.run=^TestHelperRange$")
+	cmd = testenv.CleanCmdEnv(cmd)
+	cmd.Env = append(cmd.Env, "GO_WANT_HELPER_PROCESS=1")
+	out, _ := cmd.CombinedOutput()
+	want := `--- FAIL: TestHelperRange \([^)]+\)
+    helperfuncs_test.go:139: range
+    helperfuncs_test.go:139: range
+`
+	if !regexp.MustCompile(want).Match(out) {
+		t.Errorf("got output:\n\n%s\nwant matching:\n\n%s", out, want)
 	}
 }
 

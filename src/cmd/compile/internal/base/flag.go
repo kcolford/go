@@ -78,6 +78,7 @@ type CmdFlags struct {
 	LowerR CountFlag  "help:\"debug generated wrappers\""
 	LowerT bool       "help:\"enable tracing for debugging the compiler\""
 	LowerW CountFlag  "help:\"debug type checking\""
+	LowerU CountFlag  "help:\"emit unsorted warnings/errors\""
 	LowerV *bool      "help:\"increase debug verbosity\""
 
 	// Special characters
@@ -100,6 +101,7 @@ type CmdFlags struct {
 	Dynlink            *bool        "help:\"support references to Go symbols defined in other shared libraries\"" // &Ctxt.Flag_dynlink, set below
 	EmbedCfg           func(string) "help:\"read go:embed configuration from `file`\""
 	Env                func(string) "help:\"add `definition` of the form key=value to environment\""
+	ExportFD           int          "help:\"write a byte to file descriptor `fd` once the export data has been written\""
 	GenDwarfInl        int          "help:\"generate DWARF inline info records\"" // 0=disabled, 1=funcs, 2=funcs+formals/locals
 	GoVersion          string       "help:\"required version of the runtime\""
 	ImportCfg          func(string) "help:\"read import configuration from `file`\""
@@ -177,16 +179,20 @@ func ParseFlags() {
 	Flag.WB = true
 
 	Debug.ConcurrentOk = true
+	Debug.CompressInstructions = 1
 	Debug.MaxShapeLen = 500
 	Debug.AlignHot = 1
 	Debug.InlFuncsWithClosures = 1
 	Debug.InlStaticInit = 1
+	Debug.FreeAppend = 1
 	Debug.PGOInline = 1
 	Debug.PGODevirtualize = 2
-	Debug.SyncFrames = -1 // disable sync markers by default
+	Debug.SyncFrames = -1            // disable sync markers by default
+	Debug.VariableMakeThreshold = 32 // 32 byte default for stack allocated make results
 	Debug.ZeroCopy = 1
 	Debug.RangeFuncCheck = 1
 	Debug.MergeLocals = 1
+	Debug.RewriteResults = 1
 
 	Debug.Checkptr = -1 // so we can tell whether it is set explicitly
 
@@ -206,6 +212,7 @@ func ParseFlags() {
 	if Debug.Gossahash != "" {
 		hashDebug = NewHashDebug("gossahash", Debug.Gossahash, nil)
 	}
+	obj.SetFIPSDebugHash(Debug.FIPSHash)
 
 	// Compute whether we're compiling the runtime from the package path. Test
 	// code can also use the flag to set this explicitly.
@@ -260,14 +267,27 @@ func ParseFlags() {
 		Debug.LoopVar = 1
 	}
 
+	if Debug.Converthash != "" {
+		ConvertHash = NewHashDebug("converthash", Debug.Converthash, nil)
+	} else {
+		// quietly disable the convert hash changes
+		ConvertHash = NewHashDebug("converthash", "qn", nil)
+	}
 	if Debug.Fmahash != "" {
 		FmaHash = NewHashDebug("fmahash", Debug.Fmahash, nil)
 	}
 	if Debug.PGOHash != "" {
 		PGOHash = NewHashDebug("pgohash", Debug.PGOHash, nil)
 	}
+	if Debug.LiteralAllocHash != "" {
+		LiteralAllocHash = NewHashDebug("literalalloc", Debug.LiteralAllocHash, nil)
+	}
+
 	if Debug.MergeLocalsHash != "" {
 		MergeLocalsHash = NewHashDebug("mergelocals", Debug.MergeLocalsHash, nil)
+	}
+	if Debug.VariableMakeHash != "" {
+		VariableMakeHash = NewHashDebug("variablemake", Debug.VariableMakeHash, nil)
 	}
 
 	if Flag.MSan && !platform.MSanSupported(buildcfg.GOOS, buildcfg.GOARCH) {
@@ -284,6 +304,7 @@ func ParseFlags() {
 	}
 	parseSpectre(Flag.Spectre) // left as string for RecordFlags
 
+	Ctxt.CompressInstructions = Debug.CompressInstructions != 0
 	Ctxt.Flag_shared = Ctxt.Flag_dynlink || Ctxt.Flag_shared
 	Ctxt.Flag_optimize = Flag.N == 0
 	Ctxt.Debugasm = int(Flag.S)
@@ -340,6 +361,9 @@ func ParseFlags() {
 	if Flag.LowerC < 1 {
 		log.Fatalf("-c must be at least 1, got %d", Flag.LowerC)
 	}
+	if Flag.ExportFD > 0 && Flag.LinkObj == "" {
+		log.Fatalf("-exportfd requires -linkobj")
+	}
 	if !concurrentBackendAllowed() {
 		Flag.LowerC = 1
 	}
@@ -355,6 +379,10 @@ func ParseFlags() {
 
 		// Fuzzing the runtime isn't interesting either.
 		Debug.Libfuzzer = 0
+	}
+
+	if len(Flag.Cfg.ImportDirs) > 0 && Flag.Cfg.PackageFile != nil {
+		log.Fatalf("cannot use both -I and -importcfg")
 	}
 
 	if Debug.Checkptr == -1 { // if not set explicitly
@@ -374,14 +402,14 @@ func ParseFlags() {
 // See the comment on type CmdFlags for the rules.
 func registerFlags() {
 	var (
-		boolType      = reflect.TypeOf(bool(false))
-		intType       = reflect.TypeOf(int(0))
-		stringType    = reflect.TypeOf(string(""))
-		ptrBoolType   = reflect.TypeOf(new(bool))
-		ptrIntType    = reflect.TypeOf(new(int))
-		ptrStringType = reflect.TypeOf(new(string))
-		countType     = reflect.TypeOf(CountFlag(0))
-		funcType      = reflect.TypeOf((func(string))(nil))
+		boolType      = reflect.TypeFor[bool]()
+		intType       = reflect.TypeFor[int]()
+		stringType    = reflect.TypeFor[string]()
+		ptrBoolType   = reflect.TypeFor[*bool]()
+		ptrIntType    = reflect.TypeFor[*int]()
+		ptrStringType = reflect.TypeFor[*string]()
+		countType     = reflect.TypeFor[CountFlag]()
+		funcType      = reflect.TypeFor[func(string)]()
 	)
 
 	v := reflect.ValueOf(&Flag).Elem()
@@ -456,7 +484,6 @@ func concurrentFlagOk() bool {
 		Flag.E == 0 &&
 		Flag.K == 0 &&
 		Flag.L == 0 &&
-		Flag.LowerH == 0 &&
 		Flag.LowerJ == 0 &&
 		Flag.LowerM == 0 &&
 		Flag.LowerR == 0
@@ -561,7 +588,7 @@ func readEmbedCfg(file string) {
 
 // parseSpectre parses the spectre configuration from the string s.
 func parseSpectre(s string) {
-	for _, f := range strings.Split(s, ",") {
+	for f := range strings.SplitSeq(s, ",") {
 		f = strings.TrimSpace(f)
 		switch f {
 		default:

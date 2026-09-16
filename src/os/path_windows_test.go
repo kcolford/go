@@ -224,7 +224,7 @@ func TestRemoveAllLongPathRelative(t *testing.T) {
 	// Test that RemoveAll doesn't hang with long relative paths.
 	// See go.dev/issue/36375.
 	tmp := t.TempDir()
-	chdir(t, tmp)
+	t.Chdir(tmp)
 	dir := filepath.Join(tmp, "foo", "bar", strings.Repeat("a", 150), strings.Repeat("b", 150))
 	err := os.MkdirAll(dir, 0755)
 	if err != nil {
@@ -232,6 +232,23 @@ func TestRemoveAllLongPathRelative(t *testing.T) {
 	}
 	err = os.RemoveAll("foo")
 	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRemoveAllFallback(t *testing.T) {
+	windows.TestDeleteatFallback = true
+	t.Cleanup(func() { windows.TestDeleteatFallback = false })
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "file1"), []byte{}, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "file2"), []byte{}, 0400); err != nil { // read-only file
+		t.Fatal(err)
+	}
+
+	if err := os.RemoveAll(dir); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -265,7 +282,7 @@ func TestLongPathAbs(t *testing.T) {
 }
 
 func TestLongPathRel(t *testing.T) {
-	chdir(t, t.TempDir())
+	t.Chdir(t.TempDir())
 
 	target := strings.Repeat("b\\", 300)
 	testLongPathAbs(t, target)

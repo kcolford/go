@@ -7,11 +7,11 @@
 
 // _rt0_wasm_js is not used itself. It only exists to mark the exported functions as alive.
 TEXT _rt0_wasm_js(SB),NOSPLIT,$0
-	I32Const $wasm_export_run(SB)
+	I64Const $wasm_export_run(SB)
 	Drop
-	I32Const $wasm_export_resume(SB)
+	I64Const $wasm_export_resume(SB)
 	Drop
-	I32Const $wasm_export_getsp(SB)
+	I64Const $wasm_export_getsp(SB)
 	Drop
 
 // wasm_export_run gets called from JavaScript. It initializes the Go runtime and executes Go code until it needs
@@ -52,12 +52,6 @@ TEXT wasm_export_resume(SB),NOSPLIT,$0
 TEXT wasm_export_getsp(SB),NOSPLIT,$0
 	Get SP
 	Return
-
-TEXT runtime·pause(SB), NOSPLIT, $0-8
-	MOVD newsp+0(FP), SP
-	I32Const $1
-	Set PAUSE
-	RETUNWIND
 
 TEXT runtime·exit(SB), NOSPLIT, $0-4
 	I32Const $0

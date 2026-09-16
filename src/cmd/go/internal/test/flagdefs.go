@@ -9,6 +9,7 @@ package test
 // passFlagToTest contains the flags that should be forwarded to
 // the test binary with the prefix "test.".
 var passFlagToTest = map[string]bool{
+	"artifacts":            true,
 	"bench":                true,
 	"benchmem":             true,
 	"benchtime":            true,
@@ -55,6 +56,7 @@ var passAnalyzersToVet = map[string]bool{
 	"directive":        true,
 	"errorsas":         true,
 	"framepointer":     true,
+	"hostport":         true,
 	"httpresponse":     true,
 	"ifaceassert":      true,
 	"loopclosure":      true,
@@ -63,9 +65,11 @@ var passAnalyzersToVet = map[string]bool{
 	"nilfunc":          true,
 	"printf":           true,
 	"rangeloops":       true,
+	"scannererr":       true,
 	"shift":            true,
 	"sigchanyzer":      true,
 	"slog":             true,
+	"sqlrowserr":       true,
 	"stdmethods":       true,
 	"stdversion":       true,
 	"stringintconv":    true,
@@ -77,4 +81,5 @@ var passAnalyzersToVet = map[string]bool{
 	"unreachable":      true,
 	"unsafeptr":        true,
 	"unusedresult":     true,
+	"waitgroup":        true,
 }

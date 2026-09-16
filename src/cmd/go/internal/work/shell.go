@@ -10,11 +10,10 @@ import (
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
-	"cmd/go/internal/par"
 	"cmd/go/internal/str"
-	"errors"
+	"cmd/internal/par"
+	"cmd/internal/pathcache"
 	"fmt"
-	"internal/lazyregexp"
 	"io"
 	"io/fs"
 	"os"
@@ -42,7 +41,7 @@ type shellShared struct {
 	workDir string // $WORK, immutable
 
 	printLock sync.Mutex
-	printFunc func(args ...any) (int, error)
+	printer   load.Printer
 	scriptDir string // current directory in printed script
 
 	mkdirCache par.Cache[string, error] // a cache of created directories
@@ -50,31 +49,43 @@ type shellShared struct {
 
 // NewShell returns a new Shell.
 //
-// Shell will internally serialize calls to the print function.
-// If print is nil, it defaults to printing to stderr.
-func NewShell(workDir string, print func(a ...any) (int, error)) *Shell {
-	if print == nil {
-		print = func(a ...any) (int, error) {
-			return fmt.Fprint(os.Stderr, a...)
-		}
+// Shell will internally serialize calls to the printer.
+// If printer is nil, it uses load.DefaultPrinter.
+func NewShell(workDir string, printer load.Printer) *Shell {
+	if printer == nil {
+		printer = load.DefaultPrinter()
 	}
 	shared := &shellShared{
-		workDir:   workDir,
-		printFunc: print,
+		workDir: workDir,
+		printer: printer,
 	}
 	return &Shell{shellShared: shared}
 }
 
-// Print emits a to this Shell's output stream, formatting it like fmt.Print.
-// It is safe to call concurrently.
-func (sh *Shell) Print(a ...any) {
-	sh.printLock.Lock()
-	defer sh.printLock.Unlock()
-	sh.printFunc(a...)
+func (sh *Shell) pkg() *load.Package {
+	if sh.action == nil {
+		return nil
+	}
+	return sh.action.Package
 }
 
-func (sh *Shell) printLocked(a ...any) {
-	sh.printFunc(a...)
+// Printf emits a to this Shell's output stream, formatting it like fmt.Printf.
+// It is safe to call concurrently.
+func (sh *Shell) Printf(format string, a ...any) {
+	sh.printLock.Lock()
+	defer sh.printLock.Unlock()
+	sh.printer.Printf(sh.pkg(), format, a...)
+}
+
+func (sh *Shell) printfLocked(format string, a ...any) {
+	sh.printer.Printf(sh.pkg(), format, a...)
+}
+
+// Errorf reports an error on sh's package and sets the process exit status to 1.
+func (sh *Shell) Errorf(format string, a ...any) {
+	sh.printLock.Lock()
+	defer sh.printLock.Unlock()
+	sh.printer.Errorf(sh.pkg(), format, a...)
 }
 
 // WithAction returns a Shell identical to sh, but bound to Action a.
@@ -110,11 +121,16 @@ func (sh *Shell) moveOrCopyFile(dst, src string, perm fs.FileMode, force bool) e
 		return nil
 	}
 
+	err := checkDstOverwrite(dst, force)
+	if err != nil {
+		return err
+	}
+
 	// If we can update the mode and rename to the dst, do it.
 	// Otherwise fall back to standard copy.
 
 	// If the source is in the build cache, we need to copy it.
-	dir, _ := cache.DefaultDir()
+	dir, _, _ := cache.DefaultDir()
 	if strings.HasPrefix(src, dir) {
 		return sh.CopyFile(dst, src, perm, force)
 	}
@@ -165,7 +181,7 @@ func (sh *Shell) moveOrCopyFile(dst, src string, perm fs.FileMode, force bool) e
 	return sh.CopyFile(dst, src, perm, force)
 }
 
-// copyFile is like 'cp src dst'.
+// CopyFile is like 'cp src dst'.
 func (sh *Shell) CopyFile(dst, src string, perm fs.FileMode, force bool) error {
 	if cfg.BuildN || cfg.BuildX {
 		sh.ShowCmd("", "cp %s %s", src, dst)
@@ -180,16 +196,9 @@ func (sh *Shell) CopyFile(dst, src string, perm fs.FileMode, force bool) error {
 	}
 	defer sf.Close()
 
-	// Be careful about removing/overwriting dst.
-	// Do not remove/overwrite if dst exists and is a directory
-	// or a non-empty non-object file.
-	if fi, err := os.Stat(dst); err == nil {
-		if fi.IsDir() {
-			return fmt.Errorf("build output %q already exists and is a directory", dst)
-		}
-		if !force && fi.Mode().IsRegular() && fi.Size() != 0 && !isObject(dst) {
-			return fmt.Errorf("build output %q already exists and is not an object file", dst)
-		}
+	err = checkDstOverwrite(dst, force)
+	if err != nil {
+		return err
 	}
 
 	// On Windows, remove lingering ~ file from last attempt.
@@ -232,6 +241,21 @@ func mayberemovefile(s string) {
 		return
 	}
 	os.Remove(s)
+}
+
+// Be careful about removing/overwriting dst.
+// Do not remove/overwrite if dst exists and is a directory
+// or a non-empty non-object file.
+func checkDstOverwrite(dst string, force bool) error {
+	if fi, err := os.Stat(dst); err == nil {
+		if fi.IsDir() {
+			return fmt.Errorf("build output %q already exists and is a directory", dst)
+		}
+		if !force && fi.Mode().IsRegular() && fi.Size() != 0 && !isObject(dst) {
+			return fmt.Errorf("build output %q already exists and is not an object file", dst)
+		}
+	}
+	return nil
 }
 
 // writeFile writes the text to file.
@@ -358,7 +382,7 @@ func (sh *Shell) ShowCmd(dir string, format string, args ...any) {
 	if dir != "" && dir != "/" {
 		if dir != sh.scriptDir {
 			// Show changing to dir and update the current directory.
-			sh.printLocked(sh.fmtCmd("", "cd %s\n", dir))
+			sh.printfLocked("%s", sh.fmtCmd("", "cd %s\n", dir))
 			sh.scriptDir = dir
 		}
 		// Replace scriptDir is our working directory. Replace it
@@ -370,7 +394,7 @@ func (sh *Shell) ShowCmd(dir string, format string, args ...any) {
 		cmd = strings.ReplaceAll(" "+cmd, " "+dir, dot)[1:]
 	}
 
-	sh.printLocked(cmd + "\n")
+	sh.printfLocked("%s\n", cmd)
 }
 
 // reportCmd reports the output and exit status of a command. The cmdOut and
@@ -485,15 +509,6 @@ func (sh *Shell) reportCmd(desc, dir string, cmdOut []byte, cmdErr error) error 
 		dir = dirP
 	}
 
-	// Fix up output referring to cgo-generated code to be more readable.
-	// Replace x.go:19[/tmp/.../x.cgo1.go:18] with x.go:19.
-	// Replace *[100]_Ctype_foo with *[100]C.foo.
-	// If we're using -x, assume we're debugging and want the full dump, so disable the rewrite.
-	if !cfg.BuildX && cgoLine.MatchString(out) {
-		out = cgoLine.ReplaceAllString(out, "")
-		out = cgoTypeSigRe.ReplaceAllString(out, "C.")
-	}
-
 	// Usually desc is already p.Desc(), but if not, signal cmdError.Error to
 	// add a line explicitly mentioning the import path.
 	needsPath := importPath != "" && p != nil && desc != p.Desc()
@@ -509,7 +524,7 @@ func (sh *Shell) reportCmd(desc, dir string, cmdOut []byte, cmdErr error) error 
 		a.output = append(a.output, err.Error()...)
 	} else {
 		// Write directly to the Builder output.
-		sh.Print(err.Error())
+		sh.Printf("%s", err)
 	}
 	return nil
 }
@@ -554,9 +569,6 @@ func (e *cmdError) ImportPath() string {
 	return e.importPath
 }
 
-var cgoLine = lazyregexp.New(`\[[^\[\]]+\.(cgo1|cover)\.go:[0-9]+(:[0-9]+)?\]`)
-var cgoTypeSigRe = lazyregexp.New(`\b_C2?(type|func|var|macro)_\B`)
-
 // run runs the command given by cmdline in the directory dir.
 // If the command fails, run prints information about the failure
 // and returns a non-nil error.
@@ -572,6 +584,17 @@ func (sh *Shell) run(dir string, desc string, env []string, cmdargs ...any) erro
 // It returns the command output and any errors that occurred.
 // It accumulates execution time in a.
 func (sh *Shell) runOut(dir string, env []string, cmdargs ...any) ([]byte, error) {
+	sc, err := sh.startOut(dir, env, nil, nil, cmdargs...)
+	if err != nil || sc == nil {
+		return nil, err
+	}
+	return sc.wait()
+}
+
+func (sh *Shell) startOut(dir string, env []string, extraFiles []*os.File, done func(), cmdargs ...any) (*shellCmd, error) {
+	for _, f := range extraFiles {
+		defer f.Close()
+	}
 	a := sh.action
 
 	cmdline := str.StringList(cmdargs...)
@@ -605,8 +628,7 @@ func (sh *Shell) runOut(dir string, env []string, cmdargs ...any) ([]byte, error
 		}
 	}
 
-	var buf bytes.Buffer
-	path, err := cfg.LookPath(cmdline[0])
+	path, err := pathcache.LookPath(cmdline[0])
 	if err != nil {
 		return nil, err
 	}
@@ -614,10 +636,11 @@ func (sh *Shell) runOut(dir string, env []string, cmdargs ...any) ([]byte, error
 	if cmd.Path != "" {
 		cmd.Args[0] = cmd.Path
 	}
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
-	cleanup := passLongArgsInResponseFiles(cmd)
-	defer cleanup()
+	sc := &shellCmd{sh: sh, cmd: cmd, cmdline: cmdline, done: done}
+	cmd.Stdout = &sc.buf
+	cmd.Stderr = &sc.buf
+	cmd.ExtraFiles = extraFiles
+	sc.cleanup = passLongArgsInResponseFiles(cmd)
 	if dir != "." {
 		cmd.Dir = dir
 	}
@@ -633,13 +656,35 @@ func (sh *Shell) runOut(dir string, env []string, cmdargs ...any) ([]byte, error
 	}
 
 	cmd.Env = append(cmd.Env, env...)
-	start := time.Now()
-	err = cmd.Run()
-	if a != nil && a.json != nil {
+	sc.start = time.Now()
+	if err := cmd.Start(); err != nil {
+		sc.cleanup()
+		return nil, fmt.Errorf("%s: %w", cmdline[0], err)
+	}
+	return sc, nil
+}
+
+type shellCmd struct {
+	sh      *Shell
+	cmd     *exec.Cmd
+	cmdline []string
+	buf     bytes.Buffer
+	start   time.Time
+	cleanup func()
+	done    func()
+}
+
+func (sc *shellCmd) wait() ([]byte, error) {
+	err := sc.cmd.Wait()
+	sc.cleanup()
+	if sc.done != nil {
+		sc.done()
+	}
+	if a := sc.sh.action; a != nil && a.json != nil {
 		aj := a.json
-		aj.Cmd = append(aj.Cmd, joinUnambiguously(cmdline))
-		aj.CmdReal += time.Since(start)
-		if ps := cmd.ProcessState; ps != nil {
+		aj.Cmd = append(aj.Cmd, joinUnambiguously(sc.cmdline))
+		aj.CmdReal += time.Since(sc.start)
+		if ps := sc.cmd.ProcessState; ps != nil {
 			aj.CmdUser += ps.UserTime()
 			aj.CmdSys += ps.SystemTime()
 		}
@@ -651,9 +696,9 @@ func (sh *Shell) runOut(dir string, env []string, cmdargs ...any) ([]byte, error
 	// shows buf.Bytes() and does not print err at all, so the
 	// prefix here does not make most output any more verbose.
 	if err != nil {
-		err = errors.New(cmdline[0] + ": " + err.Error())
+		err = fmt.Errorf("%s: %w", sc.cmdline[0], err)
 	}
-	return buf.Bytes(), err
+	return sc.buf.Bytes(), err
 }
 
 // joinUnambiguously prints the slice, quoting where necessary to make the

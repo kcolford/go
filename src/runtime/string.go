@@ -8,12 +8,22 @@ import (
 	"internal/abi"
 	"internal/bytealg"
 	"internal/goarch"
+	"internal/goos"
+	"internal/runtime/math"
+	"internal/runtime/sys"
+	"internal/strconv"
 	"unsafe"
 )
 
-// The constant is known to the compiler.
-// There is no fundamental theory behind this number.
-const tmpStringBufSize = 32
+// These constants are known to the compiler (see cmd/compile/internal/walk).
+// tmpStringBufSize bounds the stack buffer for string results (concatenation
+// and []byte/[]rune->string). tmpRuneBufSize bounds the string->[]rune buffer;
+// it is kept smaller because rune buffers cost 4 bytes per element while
+// exceeding 32 runes is rare, so a larger size would grow frames for no gain.
+const (
+	tmpStringBufSize = 64
+	tmpRuneBufSize   = 32
+)
 
 type tmpBuf [tmpStringBufSize]byte
 
@@ -50,12 +60,15 @@ func concatstrings(buf *tmpBuf, a []string) string {
 	}
 	s, b := rawstringtmp(buf, l)
 	for _, x := range a {
-		copy(b, x)
-		b = b[len(x):]
+		n := copy(b, x)
+		b = b[n:]
 	}
 	return s
 }
 
+// concatstring2 helps make the callsite smaller (compared to concatstrings),
+// and we think this is currently more valuable than omitting one call in the
+// chain, the same goes for concatstring{3,4,5}.
 func concatstring2(buf *tmpBuf, a0, a1 string) string {
 	return concatstrings(buf, []string{a0, a1})
 }
@@ -72,22 +85,64 @@ func concatstring5(buf *tmpBuf, a0, a1, a2, a3, a4 string) string {
 	return concatstrings(buf, []string{a0, a1, a2, a3, a4})
 }
 
+// concatbytes implements a Go string concatenation x+y+z+... returning a slice
+// of bytes.
+// The operands are passed in the slice a.
+func concatbytes(buf *tmpBuf, a []string) []byte {
+	l := 0
+	for _, x := range a {
+		n := len(x)
+		if l+n < l {
+			throw("string concatenation too long")
+		}
+		l += n
+	}
+	if l == 0 {
+		// This is to match the return type of the non-optimized concatenation.
+		return []byte{}
+	}
+
+	var b []byte
+	if buf != nil && l <= len(buf) {
+		*buf = tmpBuf{}
+		b = buf[:l]
+	} else {
+		b = rawbyteslice(l)
+	}
+	offset := 0
+	for _, x := range a {
+		copy(b[offset:], x)
+		offset += len(x)
+	}
+
+	return b
+}
+
+// concatbyte2 helps make the callsite smaller (compared to concatbytes),
+// and we think this is currently more valuable than omitting one call in
+// the chain, the same goes for concatbyte{3,4,5}.
+func concatbyte2(buf *tmpBuf, a0, a1 string) []byte {
+	return concatbytes(buf, []string{a0, a1})
+}
+
+func concatbyte3(buf *tmpBuf, a0, a1, a2 string) []byte {
+	return concatbytes(buf, []string{a0, a1, a2})
+}
+
+func concatbyte4(buf *tmpBuf, a0, a1, a2, a3 string) []byte {
+	return concatbytes(buf, []string{a0, a1, a2, a3})
+}
+
+func concatbyte5(buf *tmpBuf, a0, a1, a2, a3, a4 string) []byte {
+	return concatbytes(buf, []string{a0, a1, a2, a3, a4})
+}
+
 // slicebytetostring converts a byte slice to a string.
 // It is inserted by the compiler into generated code.
 // ptr is a pointer to the first element of the slice;
 // n is the length of the slice.
 // Buf is a fixed-size buffer for the result,
 // it is not nil if the result does not escape.
-//
-// slicebytetostring should be an internal detail,
-// but widely used packages access it using linkname.
-// Notable members of the hall of shame include:
-//   - github.com/cloudwego/frugal
-//
-// Do not remove or change the type signature.
-// See go.dev/issue/67401.
-//
-//go:linkname slicebytetostring
 func slicebytetostring(buf *tmpBuf, ptr *byte, n int) string {
 	if n == 0 {
 		// Turns out to be a relatively common case.
@@ -98,7 +153,7 @@ func slicebytetostring(buf *tmpBuf, ptr *byte, n int) string {
 	if raceenabled {
 		racereadrangepc(unsafe.Pointer(ptr),
 			uintptr(n),
-			getcallerpc(),
+			sys.GetCallerPC(),
 			abi.FuncPCABIInternal(slicebytetostring))
 	}
 	if msanenabled {
@@ -161,7 +216,7 @@ func slicebytetostringtmp(ptr *byte, n int) string {
 	if raceenabled && n > 0 {
 		racereadrangepc(unsafe.Pointer(ptr),
 			uintptr(n),
-			getcallerpc(),
+			sys.GetCallerPC(),
 			abi.FuncPCABIInternal(slicebytetostringtmp))
 	}
 	if msanenabled && n > 0 {
@@ -185,7 +240,7 @@ func stringtoslicebyte(buf *tmpBuf, s string) []byte {
 	return b
 }
 
-func stringtoslicerune(buf *[tmpStringBufSize]rune, s string) []rune {
+func stringtoslicerune(buf *[tmpRuneBufSize]rune, s string) []rune {
 	// two passes.
 	// unlike slicerunetostring, no race because strings are immutable.
 	n := 0
@@ -195,7 +250,7 @@ func stringtoslicerune(buf *[tmpStringBufSize]rune, s string) []rune {
 
 	var a []rune
 	if buf != nil && n <= len(buf) {
-		*buf = [tmpStringBufSize]rune{}
+		*buf = [tmpRuneBufSize]rune{}
 		a = buf[:n]
 	} else {
 		a = rawruneslice(n)
@@ -213,7 +268,7 @@ func slicerunetostring(buf *tmpBuf, a []rune) string {
 	if raceenabled && len(a) > 0 {
 		racereadrangepc(unsafe.Pointer(&a[0]),
 			uintptr(len(a))*unsafe.Sizeof(a[0]),
-			getcallerpc(),
+			sys.GetCallerPC(),
 			abi.FuncPCABIInternal(slicerunetostring))
 	}
 	if msanenabled && len(a) > 0 {
@@ -351,77 +406,6 @@ func gostringn(p *byte, l int) string {
 	return s
 }
 
-const (
-	maxUint64 = ^uint64(0)
-	maxInt64  = int64(maxUint64 >> 1)
-)
-
-// atoi64 parses an int64 from a string s.
-// The bool result reports whether s is a number
-// representable by a value of type int64.
-func atoi64(s string) (int64, bool) {
-	if s == "" {
-		return 0, false
-	}
-
-	neg := false
-	if s[0] == '-' {
-		neg = true
-		s = s[1:]
-	}
-
-	un := uint64(0)
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		if un > maxUint64/10 {
-			// overflow
-			return 0, false
-		}
-		un *= 10
-		un1 := un + uint64(c) - '0'
-		if un1 < un {
-			// overflow
-			return 0, false
-		}
-		un = un1
-	}
-
-	if !neg && un > uint64(maxInt64) {
-		return 0, false
-	}
-	if neg && un > uint64(maxInt64)+1 {
-		return 0, false
-	}
-
-	n := int64(un)
-	if neg {
-		n = -n
-	}
-
-	return n, true
-}
-
-// atoi is like atoi64 but for integers
-// that fit into an int.
-func atoi(s string) (int, bool) {
-	if n, ok := atoi64(s); n == int64(int(n)) {
-		return int(n), ok
-	}
-	return 0, false
-}
-
-// atoi32 is like atoi but for integers
-// that fit into an int32.
-func atoi32(s string) (int32, bool) {
-	if n, ok := atoi64(s); n == int64(int32(n)) {
-		return int32(n), ok
-	}
-	return 0, false
-}
-
 // parseByteCount parses a string that represents a count of bytes.
 //
 // s must match the following regular expression:
@@ -443,11 +427,11 @@ func parseByteCount(s string) (int64, bool) {
 	// Handle the easy non-suffix case.
 	last := s[len(s)-1]
 	if last >= '0' && last <= '9' {
-		n, ok := atoi64(s)
-		if !ok || n < 0 {
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || n < 0 {
 			return 0, false
 		}
-		return n, ok
+		return n, true
 	}
 	// Failing a trailing digit, this must always end in 'B'.
 	// Also at this point there must be at least one digit before
@@ -458,11 +442,11 @@ func parseByteCount(s string) (int64, bool) {
 	// The one before that must always be a digit or 'i'.
 	if c := s[len(s)-2]; c >= '0' && c <= '9' {
 		// Trivial 'B' suffix.
-		n, ok := atoi64(s[:len(s)-1])
-		if !ok || n < 0 {
+		n, err := strconv.ParseInt(s[:len(s)-1], 10, 64)
+		if err != nil || n < 0 {
 			return 0, false
 		}
-		return n, ok
+		return n, true
 	} else if c != 'i' {
 		return 0, false
 	}
@@ -489,17 +473,17 @@ func parseByteCount(s string) (int64, bool) {
 	for i := 0; i < power; i++ {
 		m *= 1024
 	}
-	n, ok := atoi64(s[:len(s)-3])
-	if !ok || n < 0 {
+	n, err := strconv.ParseInt(s[:len(s)-3], 10, 64)
+	if err != nil || n < 0 {
 		return 0, false
 	}
 	un := uint64(n)
-	if un > maxUint64/m {
+	if un > math.MaxUint64/m {
 		// Overflow.
 		return 0, false
 	}
 	un *= m
-	if un > uint64(maxInt64) {
+	if un > uint64(math.MaxInt64) {
 		// Overflow.
 		return 0, false
 	}
@@ -528,7 +512,9 @@ func findnull(s *byte) int {
 	// It must be the minimum page size for any architecture Go
 	// runs on. It's okay (just a minor performance loss) if the
 	// actual system page size is larger than this value.
-	const pageSize = 4096
+	// For Android, we set the page size to the MTE size, as MTE
+	// might be enforced. See issue 59090.
+	const pageSize = 4096*(1-goos.IsAndroid) + 16*goos.IsAndroid
 
 	offset := 0
 	ptr := unsafe.Pointer(s)

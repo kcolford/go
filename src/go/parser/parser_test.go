@@ -9,6 +9,7 @@ import (
 	"go/ast"
 	"go/token"
 	"io/fs"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -598,10 +599,11 @@ var parseDepthTests = []struct {
 	{name: "chan2", format: "package main; var x «<-chan »int"},
 	{name: "interface", format: "package main; var x «interface { M() «int» }»", scope: true, scopeMultiplier: 2}, // Scopes: InterfaceType, FuncType
 	{name: "map", format: "package main; var x «map[int]»int"},
-	{name: "slicelit", format: "package main; var x = «[]any{«»}»", parseMultiplier: 2},             // Parser nodes: UnaryExpr, CompositeLit
-	{name: "arraylit", format: "package main; var x = «[1]any{«nil»}»", parseMultiplier: 2},         // Parser nodes: UnaryExpr, CompositeLit
-	{name: "structlit", format: "package main; var x = «struct{x any}{«nil»}»", parseMultiplier: 2}, // Parser nodes: UnaryExpr, CompositeLit
-	{name: "maplit", format: "package main; var x = «map[int]any{1:«nil»}»", parseMultiplier: 2},    // Parser nodes: CompositeLit, KeyValueExpr
+	{name: "slicelit", format: "package main; var x = []any{«[]any{«»}»}", parseMultiplier: 3},      // Parser nodes: UnaryExpr, CompositeLit
+	{name: "arraylit", format: "package main; var x = «[1]any{«nil»}»", parseMultiplier: 3},         // Parser nodes: UnaryExpr, CompositeLit
+	{name: "structlit", format: "package main; var x = «struct{x any}{«nil»}»", parseMultiplier: 3}, // Parser nodes: UnaryExpr, CompositeLit
+	{name: "maplit", format: "package main; var x = «map[int]any{1:«nil»}»", parseMultiplier: 3},    // Parser nodes: CompositeLit, KeyValueExpr
+	//{name: "element", format: "package main; var x = struct{x any}{x: «{«»}»}"}, // TODO: fix this - currently fails
 	{name: "dot", format: "package main; var x = «x.»x"},
 	{name: "index", format: "package main; var x = x«[1]»"},
 	{name: "slice", format: "package main; var x = x«[1:2]»"},
@@ -631,6 +633,7 @@ var parseDepthTests = []struct {
 	{name: "go", format: "package main; func main() { «go func() { «» }()» }", parseMultiplier: 2, scope: true},                      // Parser nodes: GoStmt, FuncLit
 	{name: "defer", format: "package main; func main() { «defer func() { «» }()» }", parseMultiplier: 2, scope: true},                // Parser nodes: DeferStmt, FuncLit
 	{name: "select", format: "package main; func main() { «select { default: «» }» }", scope: true},
+	{name: "block", format: "package main; func main() { «{«»}» }", scope: true},
 }
 
 // split splits pre«mid»post into pre, mid, post.
@@ -819,5 +822,177 @@ func TestIssue57490(t *testing.T) {
 	offset := tokFile.Offset(funcEnd)
 	if offset != tokFile.Size() {
 		t.Fatalf("offset = %d, want %d", offset, tokFile.Size())
+	}
+}
+
+func TestParseTypeParamsAsParenExpr(t *testing.T) {
+	const src = "package p; type X[A (B),] struct{}"
+
+	fset := token.NewFileSet()
+	f, err := ParseFile(fset, "test.go", src, ParseComments|SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	typeParam := f.Decls[0].(*ast.GenDecl).Specs[0].(*ast.TypeSpec).TypeParams.List[0].Type
+	_, ok := typeParam.(*ast.ParenExpr)
+	if !ok {
+		t.Fatalf("typeParam is a %T; want: *ast.ParenExpr", typeParam)
+	}
+}
+
+// TestEmptyFileHasValidStartEnd is a regression test for #70162.
+func TestEmptyFileHasValidStartEnd(t *testing.T) {
+	for _, test := range []struct {
+		src  string
+		want string // "Pos() FileStart FileEnd"
+	}{
+		{src: "", want: "0 1 1"},
+		{src: "package ", want: "0 1 9"},
+		{src: "package p", want: "1 1 10"},
+		{src: "type T int", want: "0 1 11"},
+	} {
+		fset := token.NewFileSet()
+		f, _ := ParseFile(fset, "a.go", test.src, 0)
+		got := fmt.Sprintf("%d %d %d", f.Pos(), f.FileStart, f.FileEnd)
+		if got != test.want {
+			t.Fatalf("src = %q: got %s, want %s", test.src, got, test.want)
+		}
+	}
+}
+
+func TestCommentGroupWithLineDirective(t *testing.T) {
+	const src = `package main
+func test() {
+//line a:15:1
+	//
+}
+`
+	fset := token.NewFileSet()
+	f, err := ParseFile(fset, "test.go", src, ParseComments|SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantCommentGroups := []*ast.CommentGroup{
+		{
+			List: []*ast.Comment{
+				{
+					Slash: token.Pos(28),
+					Text:  "//line a:15:1",
+				},
+				{
+					Slash: token.Pos(43),
+					Text:  "//",
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(f.Comments, wantCommentGroups) {
+		var got, want strings.Builder
+		ast.Fprint(&got, fset, f.Comments, nil)
+		ast.Fprint(&want, fset, wantCommentGroups, nil)
+		t.Fatalf("unexpected f.Comments got:\n%v\nwant:\n%v", got.String(), want.String())
+	}
+}
+
+// TestBothLineAndLeadComment makes sure that we populate the
+// p.lineComment field even though there is a comment after the
+// line comment.
+func TestBothLineAndLeadComment(t *testing.T) {
+	const src = `package test
+
+var _ int; /* line comment */
+// Doc comment
+func _() {}
+
+var _ int; /* line comment */
+// Some comment
+
+func _() {}
+`
+
+	fset := token.NewFileSet()
+	f, _ := ParseFile(fset, "", src, ParseComments|SkipObjectResolution)
+
+	lineComment := f.Decls[0].(*ast.GenDecl).Specs[0].(*ast.ValueSpec).Comment
+	docComment := f.Decls[1].(*ast.FuncDecl).Doc
+
+	if lineComment == nil {
+		t.Fatal("missing line comment")
+	}
+	if docComment == nil {
+		t.Fatal("missing doc comment")
+	}
+
+	if lineComment.List[0].Text != "/* line comment */" {
+		t.Errorf(`unexpected line comment got = %q; want "/* line comment */"`, lineComment.List[0].Text)
+	}
+	if docComment.List[0].Text != "// Doc comment" {
+		t.Errorf(`unexpected line comment got = %q; want "// Doc comment"`, docComment.List[0].Text)
+	}
+
+	lineComment2 := f.Decls[2].(*ast.GenDecl).Specs[0].(*ast.ValueSpec).Comment
+	if lineComment2 == nil {
+		t.Fatal("missing line comment")
+	}
+	if lineComment.List[0].Text != "/* line comment */" {
+		t.Errorf(`unexpected line comment got = %q; want "/* line comment */"`, lineComment.List[0].Text)
+	}
+
+	docComment2 := f.Decls[3].(*ast.FuncDecl).Doc
+	if docComment2 != nil {
+		t.Errorf("unexpected doc comment %v", docComment2)
+	}
+}
+
+// Tests of BasicLit.End() method, which in go1.26 started precisely
+// recording the Value token's end position instead of heuristically
+// computing it, which is inaccurate for strings containing "\r".
+func TestBasicLit_End(t *testing.T) {
+	// lit is a raw string literal containing [a b c \r \n],
+	// denoting "abc\n", because the scanner normalizes \r\n to \n.
+	const stringlit = "`abc\r\n`"
+
+	// The semicolons exercise the case in which the next token
+	// (a SEMICOLON implied by a \n) isn't immediate but follows
+	// some horizontal space.
+	const src = `package p
+
+import ` + stringlit + ` ;
+
+type _ struct{ x int ` + stringlit + ` }
+
+const _ = ` + stringlit + ` ;
+`
+
+	fset := token.NewFileSet()
+	f, _ := ParseFile(fset, "", src, ParseComments|SkipObjectResolution)
+	tokFile := fset.File(f.Pos())
+
+	count := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.BasicLit); ok {
+			count++
+			var (
+				start = tokFile.Offset(lit.Pos())
+				end   = tokFile.Offset(lit.End())
+			)
+
+			// Check BasicLit.Value.
+			if want := "`abc\n`"; lit.Value != want {
+				t.Errorf("%s: BasicLit.Value = %q, want %q", fset.Position(lit.Pos()), lit.Value, want)
+			}
+
+			// Check source extent.
+			if got := src[start:end]; got != stringlit {
+				t.Errorf("%s: src[BasicLit.Pos:End] = %q, want %q", fset.Position(lit.Pos()), got, stringlit)
+			}
+		}
+		return true
+	})
+	if count != 3 {
+		t.Errorf("found %d BasicLit, want 3", count)
 	}
 }

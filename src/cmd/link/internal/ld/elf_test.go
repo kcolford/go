@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build cgo
+//go:build cgo && (dragonfly || freebsd || linux || netbsd || openbsd || solaris)
 
 package ld
 
@@ -52,7 +52,7 @@ func main() {
 
 	elfFile, err := elf.NewFile(fi)
 	if err != nil {
-		t.Skip("The system may not support ELF, skipped.")
+		t.Fatal(err)
 	}
 
 	section := elfFile.Section(".dynsym")
@@ -94,14 +94,8 @@ func TestNoDuplicateNeededEntries(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Failed to get working directory: %v", err)
-	}
-
 	path := filepath.Join(dir, "x")
-	argv := []string{"build", "-o", path, filepath.Join(wd, "testdata", "issue39256")}
+	argv := []string{"build", "-o", path, "./testdata/issue39256"}
 	out, err := testenv.Command(t, testenv.GoToolPath(t), argv...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("Build failure: %s\n%s\n", err, string(out))
@@ -159,7 +153,7 @@ func main() {
 
 	elfFile, err := elf.NewFile(fi)
 	if err != nil {
-		t.Skip("The system may not support ELF, skipped.")
+		t.Fatal(err)
 	}
 
 	section := elfFile.Section(".shstrtab")
@@ -284,7 +278,8 @@ func TestElfBindNow(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if test.mustInternalLink {
-				testenv.MustInternalLink(t, test.mustHaveCGO)
+				// N.B. none of the tests pass -asan/-msan/-asan.
+				testenv.MustInternalLink(t, testenv.SpecialBuildTypes{Cgo: test.mustHaveCGO})
 			}
 			if test.mustHaveCGO {
 				testenv.MustHaveCGO(t)
@@ -321,7 +316,7 @@ func TestElfBindNow(t *testing.T) {
 
 			elfFile, err := elf.NewFile(fi)
 			if err != nil {
-				t.Skip("The system may not support ELF, skipped.")
+				t.Fatal(err)
 			}
 			defer elfFile.Close()
 
@@ -413,8 +408,7 @@ func TestElfBindNow(t *testing.T) {
 }
 
 // This program is intended to be just big/complicated enough that
-// we wind up with decent-sized .data.rel.ro.{typelink,itablink,gopclntab}
-// sections.
+// we wind up with a decent-sized .data.rel.ro.go.type section.
 const ifacecallsProg = `
 package main
 
@@ -493,7 +487,7 @@ func TestRelroSectionOverlapIssue67261(t *testing.T) {
 
 	elfFile, err := elf.NewFile(fi)
 	if err != nil {
-		t.Skip("The system may not support ELF, skipped.")
+		t.Fatal(err)
 	}
 	defer elfFile.Close()
 
@@ -595,7 +589,7 @@ func TestRelroSectionOverlapIssue67261(t *testing.T) {
 		} else {
 			// Non-empty output indicates failure, as mentioned above.
 			if len(string(sout)) != 0 {
-				t.Errorf("unexpected outut from %s:\n%s\n", sprog, string(sout))
+				t.Errorf("unexpected output from %s:\n%s\n", sprog, string(sout))
 			}
 		}
 		rcmd := testenv.Command(t, filepath.Join(dir, targ))

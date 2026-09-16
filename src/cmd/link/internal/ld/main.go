@@ -55,9 +55,11 @@ var (
 )
 
 func init() {
-	flag.Var(&rpath, "r", "set the ELF dynamic linker search `path` to dir1:dir2:...")
 	flag.Var(&flagExtld, "extld", "use `linker` when linking in external mode")
 	flag.Var(&flagExtldflags, "extldflags", "pass `flags` to external linker")
+	flag.Var(&macOS, "macos", "mac OS version to write in build info (only used in internal linking)")
+	flag.Var(&macSDK, "macsdk", "mac SDK version to write in build info (only used in internal linking)")
+	flag.Var(&rpath, "r", "set the ELF dynamic linker search `path` to dir1:dir2:...")
 	flag.Var(&flagW, "w", "disable DWARF generation")
 }
 
@@ -68,6 +70,7 @@ var (
 
 	flagOutfile    = flag.String("o", "", "write output to `file`")
 	flagPluginPath = flag.String("pluginpath", "", "full path name for plugin")
+	flagFipso      = flag.String("fipso", "", "write fips module to `file`")
 
 	flagInstallSuffix = flag.String("installsuffix", "", "set package directory `suffix`")
 	flagDumpDep       = flag.Bool("dumpdep", false, "dump symbol dependency graph")
@@ -95,6 +98,7 @@ var (
 	flagN             = flag.Bool("n", false, "no-op (deprecated)")
 	FlagS             = flag.Bool("s", false, "disable symbol table")
 	flag8             bool // use 64-bit addresses in symbol table
+	flagHostBuildid   = flag.String("B", "", "set ELF NT_GNU_BUILD_ID `note` or Mach-O UUID; use \"gobuildid\" to generate it from the Go build ID; \"none\" to disable")
 	flagInterpreter   = flag.String("I", "", "use `linker` as ELF dynamic linker")
 	flagCheckLinkname = flag.Bool("checklinkname", true, "check linkname symbol references")
 	FlagDebugTramp    = flag.Int("debugtramp", 0, "debug trampolines")
@@ -103,9 +107,12 @@ var (
 	FlagStrictDups    = flag.Int("strictdups", 0, "sanity check duplicate symbol contents during object file reading (1=warn 2=err).")
 	FlagRound         = flag.Int64("R", -1, "set address rounding `quantum`")
 	FlagTextAddr      = flag.Int64("T", -1, "set the start address of text symbols")
+	FlagDataAddr      = flag.Int64("D", -1, "set the start address of data symbols")
+	FlagFuncAlign     = flag.Int("funcalign", 0, "set function align to `N` bytes")
 	flagEntrySymbol   = flag.String("E", "", "set `entry` symbol name")
 	flagPruneWeakMap  = flag.Bool("pruneweakmap", true, "prune weak mapinit refs")
 	flagRandLayout    = flag.Int64("randlayout", 0, "randomize function layout")
+	flagAllErrors     = flag.Bool("e", false, "no limit on number of errors reported")
 	cpuprofile        = flag.String("cpuprofile", "", "write cpu profile to `file`")
 	memprofile        = flag.String("memprofile", "", "write memory profile to `file`")
 	memprofilerate    = flag.Int64("memprofilerate", 0, "set runtime.MemProfileRate to `rate`")
@@ -183,7 +190,11 @@ func Main(arch *sys.Arch, theArch Arch) {
 
 	buildVersion := buildcfg.Version
 	if goexperiment := buildcfg.Experiment.String(); goexperiment != "" {
-		buildVersion += " X:" + goexperiment
+		sep := " "
+		if !strings.Contains(buildVersion, "-") { // See go.dev/issue/75953.
+			sep = "-"
+		}
+		buildVersion += sep + "X:" + goexperiment
 	}
 	addstrdata1(ctxt, "runtime.buildVersion="+buildVersion)
 
@@ -196,7 +207,6 @@ func Main(arch *sys.Arch, theArch Arch) {
 	flag.Var(&ctxt.LinkMode, "linkmode", "set link `mode`")
 	flag.Var(&ctxt.BuildMode, "buildmode", "set build `mode`")
 	flag.BoolVar(&ctxt.compressDWARF, "compressdwarf", true, "compress DWARF if possible")
-	objabi.Flagfn1("B", "add an ELF NT_GNU_BUILD_ID `note` when using ELF; use \"gobuildid\" to generate it from the Go build ID", addbuildinfo)
 	objabi.Flagfn1("L", "add specified `directory` to library path", func(a string) { Lflag(ctxt, a) })
 	objabi.AddVersionFlag() // -V
 	objabi.Flagfn1("X", "add string value `definition` of the form importpath.name=value", func(s string) { addstrdata1(ctxt, s) })
@@ -226,7 +236,7 @@ func Main(arch *sys.Arch, theArch Arch) {
 		windowsgui = true
 	default:
 		if err := ctxt.HeadType.Set(*flagHeadType); err != nil {
-			Errorf(nil, "%v", err)
+			Errorf("%v", err)
 			usage()
 		}
 	}
@@ -235,7 +245,7 @@ func Main(arch *sys.Arch, theArch Arch) {
 	}
 
 	if !*flagAslr && ctxt.BuildMode != BuildModeCShared {
-		Errorf(nil, "-aslr=false is only allowed for -buildmode=c-shared")
+		Errorf("-aslr=false is only allowed for -buildmode=c-shared")
 		usage()
 	}
 
@@ -248,6 +258,9 @@ func Main(arch *sys.Arch, theArch Arch) {
 	}
 	if *FlagRound != -1 && (*FlagRound < 4096 || !isPowerOfTwo(*FlagRound)) {
 		Exitf("invalid -R value 0x%x", *FlagRound)
+	}
+	if *FlagFuncAlign != 0 && !isPowerOfTwo(int64(*FlagFuncAlign)) {
+		Exitf("invalid -funcalign value %d", *FlagFuncAlign)
 	}
 
 	checkStrictDups = *FlagStrictDups
@@ -286,13 +299,10 @@ func Main(arch *sys.Arch, theArch Arch) {
 
 	interpreter = *flagInterpreter
 
-	if *flagBuildid == "" && ctxt.Target.IsOpenbsd() {
-		// TODO(jsing): Remove once direct syscalls are no longer in use.
-		// OpenBSD 6.7 onwards will not permit direct syscalls from a
-		// dynamically linked binary unless it identifies the binary
-		// contains a .note.go.buildid ELF note. See issue #36435.
-		*flagBuildid = "go-openbsd"
+	if *flagHostBuildid == "" && *flagBuildid != "" {
+		*flagHostBuildid = "gobuildid"
 	}
+	addbuildinfo(ctxt)
 
 	// enable benchmarking
 	var bench *benchmark.Metrics
@@ -302,7 +312,7 @@ func Main(arch *sys.Arch, theArch Arch) {
 		} else if *benchmarkFlag == "cpu" {
 			bench = benchmark.New(benchmark.NoGC, *benchmarkFileFlag)
 		} else {
-			Errorf(nil, "unknown benchmark flag: %q", *benchmarkFlag)
+			Errorf("unknown benchmark flag: %q", *benchmarkFlag)
 			usage()
 		}
 	}
@@ -313,6 +323,10 @@ func Main(arch *sys.Arch, theArch Arch) {
 	ctxt.computeTLSOffset()
 	bench.Start("Archinit")
 	thearch.Archinit(ctxt)
+
+	if *FlagDataAddr != -1 && *FlagDataAddr%*FlagRound != 0 {
+		Exitf("invalid -D value 0x%x: not aligned to rounding quantum 0x%x", *FlagDataAddr, *FlagRound)
+	}
 
 	if ctxt.linkShared && !ctxt.IsELF {
 		Exitf("-linkshared can only be used on elf systems")
@@ -410,8 +424,6 @@ func Main(arch *sys.Arch, theArch Arch) {
 
 	bench.Start("textaddress")
 	ctxt.textaddress()
-	bench.Start("typelink")
-	ctxt.typelink()
 	bench.Start("buildinfo")
 	ctxt.buildinfo()
 	bench.Start("pclntab")
@@ -449,7 +461,6 @@ func Main(arch *sys.Arch, theArch Arch) {
 	// will be applied directly there.
 	bench.Start("Asmb")
 	asmb(ctxt)
-
 	exitIfErrors()
 
 	// Generate additional symbols for the native symbol table just prior
@@ -458,6 +469,8 @@ func Main(arch *sys.Arch, theArch Arch) {
 	if thearch.GenSymsLate != nil {
 		thearch.GenSymsLate(ctxt, ctxt.loader)
 	}
+
+	asmbfips(ctxt, *flagFipso)
 
 	bench.Start("Asmb2")
 	asmb2(ctxt)

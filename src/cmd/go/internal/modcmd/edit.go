@@ -60,10 +60,14 @@ constraints imposed by other modules.
 
 The -go=version flag sets the expected Go language version.
 This flag is mainly for tools that understand Go version dependencies.
+It takes a version like "1.26" or "1.26.2".
+Using the version "none" removes the go directive.
 Users should prefer 'go get go@version'.
 
-The -toolchain=version flag sets the Go toolchain to use.
+The -toolchain=name flag sets the Go toolchain to use.
 This flag is mainly for tools that understand Go version dependencies.
+It takes a toolchain name like "go1.26" or "go1.26.2".
+Using the name "none" removes the toolchain directive.
 Users should prefer 'go get toolchain@version'.
 
 The -exclude=path@version and -dropexclude=path@version flags
@@ -87,20 +91,22 @@ retraction on the given version. The version may be a single version
 like "v1.2.3" or a closed interval like "[v1.1.0,v1.1.9]". Note that
 -retract=version is a no-op if that retraction already exists.
 
+The -tool=path and -droptool=path flags add and drop a tool declaration
+for the given path.
+
+The -ignore=path and -dropignore=path flags add and drop a ignore declaration
+for the given path.
+
 The -godebug, -dropgodebug, -require, -droprequire, -exclude, -dropexclude,
--replace, -dropreplace, -retract, and -dropretract editing flags may be
-repeated, and the changes are applied in the order given.
+-replace, -dropreplace, -retract, -dropretract, -tool, -droptool, -ignore,
+and -dropignore editing flags may be repeated, and the changes are applied
+in the order given.
 
 The -print flag prints the final go.mod in its text format instead of
 writing it back to go.mod.
 
 The -json flag prints the final go.mod file in JSON format instead of
 writing it back to go.mod. The JSON output corresponds to these Go types:
-
-	type Module struct {
-		Path    string
-		Version string
-	}
 
 	type GoMod struct {
 		Module    ModPath
@@ -111,6 +117,13 @@ writing it back to go.mod. The JSON output corresponds to these Go types:
 		Exclude   []Module
 		Replace   []Replace
 		Retract   []Retract
+		Tool      []Tool
+		Ignore    []Ignore
+	}
+
+	type Module struct {
+		Path    string
+		Version string
 	}
 
 	type ModPath struct {
@@ -140,6 +153,14 @@ writing it back to go.mod. The JSON output corresponds to these Go types:
 		Rationale string
 	}
 
+	type Tool struct {
+		Path string
+	}
+
+	type Ignore struct {
+		Path string
+	}
+
 Retract entries representing a single version (not an interval) will have
 the "Low" and "High" fields set to the same value.
 
@@ -149,17 +170,17 @@ use 'go list -m -json all'.
 
 Edit also provides the -C, -n, and -x build flags.
 
-See https://golang.org/ref/mod#go-mod-edit for more about 'go mod edit'.
+See https://go.dev/ref/mod#go-mod-edit for more about 'go mod edit'.
 	`,
 }
 
 var (
-	editFmt       = cmdEdit.Flag.Bool("fmt", false, "")
-	editGo        = cmdEdit.Flag.String("go", "", "")
-	editToolchain = cmdEdit.Flag.String("toolchain", "", "")
-	editJSON      = cmdEdit.Flag.Bool("json", false, "")
-	editPrint     = cmdEdit.Flag.Bool("print", false, "")
-	editModule    = cmdEdit.Flag.String("module", "", "")
+	editFmt       = cmdEdit.Flag.Bool("fmt", false, "reformat the go.mod file without making other changes")
+	editGo        = cmdEdit.Flag.String("go", "", "set the expected Go language version")
+	editToolchain = cmdEdit.Flag.String("toolchain", "", "set the expected Go toolchain name")
+	editJSON      = cmdEdit.Flag.Bool("json", false, "print the final go.mod file in JSON format")
+	editPrint     = cmdEdit.Flag.Bool("print", false, "print the final go.mod in its text format")
+	editModule    = cmdEdit.Flag.String("module", "", "change the module path")
 	edits         []func(*modfile.File) // edits specified in flags
 )
 
@@ -171,16 +192,20 @@ func (f flagFunc) Set(s string) error { f(s); return nil }
 func init() {
 	cmdEdit.Run = runEdit // break init cycle
 
-	cmdEdit.Flag.Var(flagFunc(flagGodebug), "godebug", "")
-	cmdEdit.Flag.Var(flagFunc(flagDropGodebug), "dropgodebug", "")
-	cmdEdit.Flag.Var(flagFunc(flagRequire), "require", "")
-	cmdEdit.Flag.Var(flagFunc(flagDropRequire), "droprequire", "")
-	cmdEdit.Flag.Var(flagFunc(flagExclude), "exclude", "")
-	cmdEdit.Flag.Var(flagFunc(flagDropExclude), "dropexclude", "")
-	cmdEdit.Flag.Var(flagFunc(flagReplace), "replace", "")
-	cmdEdit.Flag.Var(flagFunc(flagDropReplace), "dropreplace", "")
-	cmdEdit.Flag.Var(flagFunc(flagRetract), "retract", "")
-	cmdEdit.Flag.Var(flagFunc(flagDropRetract), "dropretract", "")
+	cmdEdit.Flag.Var(flagFunc(flagGodebug), "godebug", "add a godebug `key=value` line")
+	cmdEdit.Flag.Var(flagFunc(flagDropGodebug), "dropgodebug", "drop godebug lines with the given `key`")
+	cmdEdit.Flag.Var(flagFunc(flagRequire), "require", "add a require directive: `path@version`")
+	cmdEdit.Flag.Var(flagFunc(flagDropRequire), "droprequire", "drop a require directive with the given `key`")
+	cmdEdit.Flag.Var(flagFunc(flagExclude), "exclude", "add an exclude directive: `path@version`")
+	cmdEdit.Flag.Var(flagFunc(flagDropExclude), "dropexclude", "drop an exclude directive with the given `key`")
+	cmdEdit.Flag.Var(flagFunc(flagReplace), "replace", "add a replace directive: `old[@v]=new[@v]`")
+	cmdEdit.Flag.Var(flagFunc(flagDropReplace), "dropreplace", "drop a replace directive with the give `key`")
+	cmdEdit.Flag.Var(flagFunc(flagRetract), "retract", "add a retract directive: `version` or `[start, end]")
+	cmdEdit.Flag.Var(flagFunc(flagDropRetract), "dropretract", "drop a retract directive")
+	cmdEdit.Flag.Var(flagFunc(flagTool), "tool", "add a tool directive: `path`")
+	cmdEdit.Flag.Var(flagFunc(flagDropTool), "droptool", "drop a tool directive: `path`")
+	cmdEdit.Flag.Var(flagFunc(flagIgnore), "ignore", "add an ignore directive: `path`")
+	cmdEdit.Flag.Var(flagFunc(flagDropIgnore), "dropignore", "drop an ignore directive: `path`")
 
 	base.AddBuildFlagsNX(&cmdEdit.Flag)
 	base.AddChdirFlag(&cmdEdit.Flag)
@@ -188,6 +213,7 @@ func init() {
 }
 
 func runEdit(ctx context.Context, cmd *base.Command, args []string) {
+	moduleLoader := modload.NewLoader()
 	anyFlags := *editModule != "" ||
 		*editGo != "" ||
 		*editToolchain != "" ||
@@ -211,11 +237,15 @@ func runEdit(ctx context.Context, cmd *base.Command, args []string) {
 	if len(args) == 1 {
 		gomod = args[0]
 	} else {
-		gomod = modload.ModFilePath()
+		gomod = moduleLoader.ModFilePath()
 	}
 
 	if *editModule != "" {
-		if err := module.CheckImportPath(*editModule); err != nil {
+		err := module.CheckImportPath(*editModule)
+		if err == nil {
+			err = modload.CheckReservedModulePath(*editModule)
+		}
+		if err != nil {
 			base.Fatalf("go: invalid -module: %v", err)
 		}
 	}
@@ -302,7 +332,10 @@ func runEdit(ctx context.Context, cmd *base.Command, args []string) {
 
 // parsePathVersion parses -flag=arg expecting arg to be path@version.
 func parsePathVersion(flag, arg string) (path, version string) {
-	before, after, found := strings.Cut(arg, "@")
+	before, after, found, err := modload.ParsePathVersion(arg)
+	if err != nil {
+		base.Fatalf("go: -%s=%s: %v", flag, arg, err)
+	}
 	if !found {
 		base.Fatalf("go: -%s=%s: need path@version", flag, arg)
 	}
@@ -336,7 +369,10 @@ func parsePathVersionOptional(adj, arg string, allowDirPath bool) (path, version
 	if allowDirPath && modfile.IsDirectoryPath(arg) {
 		return arg, "", nil
 	}
-	before, after, found := strings.Cut(arg, "@")
+	before, after, found, err := modload.ParsePathVersion(arg)
+	if err != nil {
+		return "", "", err
+	}
 	if !found {
 		path = arg
 	} else {
@@ -517,20 +553,66 @@ func flagDropRetract(arg string) {
 	})
 }
 
+// flagTool implements the -tool flag.
+func flagTool(arg string) {
+	path := parsePath("tool", arg)
+	edits = append(edits, func(f *modfile.File) {
+		if err := f.AddTool(path); err != nil {
+			base.Fatalf("go: -tool=%s: %v", arg, err)
+		}
+	})
+}
+
+// flagDropTool implements the -droptool flag.
+func flagDropTool(arg string) {
+	path := parsePath("droptool", arg)
+	edits = append(edits, func(f *modfile.File) {
+		if err := f.DropTool(path); err != nil {
+			base.Fatalf("go: -droptool=%s: %v", arg, err)
+		}
+	})
+}
+
+// flagIgnore implements the -ignore flag.
+func flagIgnore(arg string) {
+	edits = append(edits, func(f *modfile.File) {
+		if err := f.AddIgnore(arg); err != nil {
+			base.Fatalf("go: -ignore=%s: %v", arg, err)
+		}
+	})
+}
+
+// flagDropIgnore implements the -dropignore flag.
+func flagDropIgnore(arg string) {
+	edits = append(edits, func(f *modfile.File) {
+		if err := f.DropIgnore(arg); err != nil {
+			base.Fatalf("go: -dropignore=%s: %v", arg, err)
+		}
+	})
+}
+
 // fileJSON is the -json output data structure.
 type fileJSON struct {
 	Module    editModuleJSON
-	Go        string `json:",omitempty"`
-	Toolchain string `json:",omitempty"`
-	Require   []requireJSON
-	Exclude   []module.Version
-	Replace   []replaceJSON
-	Retract   []retractJSON
+	Go        string           `json:",omitempty"`
+	Toolchain string           `json:",omitempty"`
+	GoDebug   []debugJSON      `json:",omitempty"`
+	Require   []requireJSON    `json:",omitempty"`
+	Exclude   []module.Version `json:",omitempty"`
+	Replace   []replaceJSON    `json:",omitempty"`
+	Retract   []retractJSON    `json:",omitempty"`
+	Tool      []toolJSON       `json:",omitempty"`
+	Ignore    []ignoreJSON     `json:",omitempty"`
 }
 
 type editModuleJSON struct {
 	Path       string
 	Deprecated string `json:",omitempty"`
+}
+
+type debugJSON struct {
+	Key   string
+	Value string
 }
 
 type requireJSON struct {
@@ -548,6 +630,14 @@ type retractJSON struct {
 	Low       string `json:",omitempty"`
 	High      string `json:",omitempty"`
 	Rationale string `json:",omitempty"`
+}
+
+type toolJSON struct {
+	Path string
+}
+
+type ignoreJSON struct {
+	Path string
 }
 
 // editPrintJSON prints the -json output.
@@ -576,6 +666,15 @@ func editPrintJSON(modFile *modfile.File) {
 	}
 	for _, r := range modFile.Retract {
 		f.Retract = append(f.Retract, retractJSON{r.Low, r.High, r.Rationale})
+	}
+	for _, t := range modFile.Tool {
+		f.Tool = append(f.Tool, toolJSON{t.Path})
+	}
+	for _, i := range modFile.Ignore {
+		f.Ignore = append(f.Ignore, ignoreJSON{i.Path})
+	}
+	for _, d := range modFile.Godebug {
+		f.GoDebug = append(f.GoDebug, debugJSON{d.Key, d.Value})
 	}
 	data, err := json.MarshalIndent(&f, "", "\t")
 	if err != nil {

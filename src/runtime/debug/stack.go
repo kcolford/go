@@ -13,7 +13,7 @@ import (
 	_ "unsafe" // for linkname
 )
 
-// PrintStack prints to standard error the stack trace returned by runtime.Stack.
+// PrintStack prints to standard error the stack trace returned by [runtime.Stack].
 func PrintStack() {
 	os.Stderr.Write(Stack())
 }
@@ -52,7 +52,7 @@ func SetCrashOutput(f *os.File, opts CrashOptions) error {
 		// The runtime will write to this file descriptor from
 		// low-level routines during a panic, possibly without
 		// a G, so we must call f.Fd() eagerly. This creates a
-		// danger that that the file descriptor is no longer
+		// danger that the file descriptor is no longer
 		// valid at the time of the write, because the caller
 		// (incorrectly) called f.Close() and the kernel
 		// reissued the fd in a later call to open(2), leading

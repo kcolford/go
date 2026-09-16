@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !goexperiment.jsonv2
+
 package json
 
 import (
@@ -14,10 +16,13 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strconv"
+	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 )
 
-type Optionals struct {
+type OptionalsEmpty struct {
 	Sr string `json:"sr"`
 	So string `json:"so,omitempty"`
 	Sw string `json:"-"`
@@ -45,7 +50,7 @@ type Optionals struct {
 }
 
 func TestOmitEmpty(t *testing.T) {
-	var want = `{
+	const want = `{
  "sr": "",
  "omitempty": 0,
  "slr": null,
@@ -56,8 +61,189 @@ func TestOmitEmpty(t *testing.T) {
  "str": {},
  "sto": {}
 }`
-	var o Optionals
+	var o OptionalsEmpty
 	o.Sw = "something"
+	o.Mr = map[string]any{}
+	o.Mo = map[string]any{}
+
+	got, err := MarshalIndent(&o, "", " ")
+	if err != nil {
+		t.Fatalf("MarshalIndent error: %v", err)
+	}
+	if got := string(got); got != want {
+		t.Errorf("MarshalIndent:\n\tgot:  %s\n\twant: %s\n", indentNewlines(got), indentNewlines(want))
+	}
+}
+
+type NonZeroStruct struct{}
+
+func (nzs NonZeroStruct) IsZero() bool {
+	return false
+}
+
+type NoPanicStruct struct {
+	Int int `json:"int,omitzero"`
+}
+
+func (nps *NoPanicStruct) IsZero() bool {
+	return nps.Int != 0
+}
+
+type OptionalsZero struct {
+	Sr string `json:"sr"`
+	So string `json:"so,omitzero"`
+	Sw string `json:"-"`
+
+	Ir int `json:"omitzero"` // actually named omitzero, not an option
+	Io int `json:"io,omitzero"`
+
+	Slr       []string `json:"slr,random"`
+	Slo       []string `json:"slo,omitzero"`
+	SloNonNil []string `json:"slononnil,omitzero"`
+
+	Mr  map[string]any `json:"mr"`
+	Mo  map[string]any `json:",omitzero"`
+	Moo map[string]any `json:"moo,omitzero"`
+
+	Fr   float64    `json:"fr"`
+	Fo   float64    `json:"fo,omitzero"`
+	Foo  float64    `json:"foo,omitzero"`
+	Foo2 [2]float64 `json:"foo2,omitzero"`
+
+	Br bool `json:"br"`
+	Bo bool `json:"bo,omitzero"`
+
+	Ur uint `json:"ur"`
+	Uo uint `json:"uo,omitzero"`
+
+	Str struct{} `json:"str"`
+	Sto struct{} `json:"sto,omitzero"`
+
+	Time      time.Time     `json:"time,omitzero"`
+	TimeLocal time.Time     `json:"timelocal,omitzero"`
+	Nzs       NonZeroStruct `json:"nzs,omitzero"`
+
+	NilIsZeroer    isZeroer       `json:"niliszeroer,omitzero"`    // nil interface
+	NonNilIsZeroer isZeroer       `json:"nonniliszeroer,omitzero"` // non-nil interface
+	NoPanicStruct0 isZeroer       `json:"nps0,omitzero"`           // non-nil interface with nil pointer
+	NoPanicStruct1 isZeroer       `json:"nps1,omitzero"`           // non-nil interface with non-nil pointer
+	NoPanicStruct2 *NoPanicStruct `json:"nps2,omitzero"`           // nil pointer
+	NoPanicStruct3 *NoPanicStruct `json:"nps3,omitzero"`           // non-nil pointer
+	NoPanicStruct4 NoPanicStruct  `json:"nps4,omitzero"`           // concrete type
+}
+
+func TestOmitZero(t *testing.T) {
+	const want = `{
+ "sr": "",
+ "omitzero": 0,
+ "slr": null,
+ "slononnil": [],
+ "mr": {},
+ "Mo": {},
+ "fr": 0,
+ "br": false,
+ "ur": 0,
+ "str": {},
+ "nzs": {},
+ "nps1": {},
+ "nps3": {},
+ "nps4": {}
+}`
+	var o OptionalsZero
+	o.Sw = "something"
+	o.SloNonNil = make([]string, 0)
+	o.Mr = map[string]any{}
+	o.Mo = map[string]any{}
+
+	o.Foo = -0
+	o.Foo2 = [2]float64{+0, -0}
+
+	o.TimeLocal = time.Time{}.Local()
+
+	o.NonNilIsZeroer = time.Time{}
+	o.NoPanicStruct0 = (*NoPanicStruct)(nil)
+	o.NoPanicStruct1 = &NoPanicStruct{}
+	o.NoPanicStruct3 = &NoPanicStruct{}
+
+	got, err := MarshalIndent(&o, "", " ")
+	if err != nil {
+		t.Fatalf("MarshalIndent error: %v", err)
+	}
+	if got := string(got); got != want {
+		t.Errorf("MarshalIndent:\n\tgot:  %s\n\twant: %s\n", indentNewlines(got), indentNewlines(want))
+	}
+}
+
+func TestOmitZeroMap(t *testing.T) {
+	const want = `{
+ "foo": {
+  "sr": "",
+  "omitzero": 0,
+  "slr": null,
+  "mr": null,
+  "fr": 0,
+  "br": false,
+  "ur": 0,
+  "str": {},
+  "nzs": {},
+  "nps4": {}
+ }
+}`
+	m := map[string]OptionalsZero{"foo": {}}
+	got, err := MarshalIndent(m, "", " ")
+	if err != nil {
+		t.Fatalf("MarshalIndent error: %v", err)
+	}
+	if got := string(got); got != want {
+		fmt.Println(got)
+		t.Errorf("MarshalIndent:\n\tgot:  %s\n\twant: %s\n", indentNewlines(got), indentNewlines(want))
+	}
+}
+
+type OptionalsEmptyZero struct {
+	Sr string `json:"sr"`
+	So string `json:"so,omitempty,omitzero"`
+	Sw string `json:"-"`
+
+	Io int `json:"io,omitempty,omitzero"`
+
+	Slr       []string `json:"slr,random"`
+	Slo       []string `json:"slo,omitempty,omitzero"`
+	SloNonNil []string `json:"slononnil,omitempty,omitzero"`
+
+	Mr map[string]any `json:"mr"`
+	Mo map[string]any `json:",omitempty,omitzero"`
+
+	Fr float64 `json:"fr"`
+	Fo float64 `json:"fo,omitempty,omitzero"`
+
+	Br bool `json:"br"`
+	Bo bool `json:"bo,omitempty,omitzero"`
+
+	Ur uint `json:"ur"`
+	Uo uint `json:"uo,omitempty,omitzero"`
+
+	Str struct{} `json:"str"`
+	Sto struct{} `json:"sto,omitempty,omitzero"`
+
+	Time time.Time     `json:"time,omitempty,omitzero"`
+	Nzs  NonZeroStruct `json:"nzs,omitempty,omitzero"`
+}
+
+func TestOmitEmptyZero(t *testing.T) {
+	const want = `{
+ "sr": "",
+ "slr": null,
+ "mr": {},
+ "fr": 0,
+ "br": false,
+ "ur": 0,
+ "str": {},
+ "nzs": {}
+}`
+	var o OptionalsEmptyZero
+	o.Sw = "something"
+	o.SloNonNil = make([]string, 0)
 	o.Mr = map[string]any{}
 	o.Mo = map[string]any{}
 
@@ -513,7 +699,7 @@ func TestAnonymousFields(t *testing.T) {
 		},
 		want: `{"MyInt1":1,"MyInt2":3}`,
 	}, {
-		// If an anonymous struct pointer field is nil, we should ignore
+		// If an embedded struct pointer field is nil, we should ignore
 		// the embedded fields behind it. Not properly doing so may
 		// result in the wrong output or reflect panics.
 		CaseName: Name("EmbeddedFieldBehindNilPointer"),
@@ -925,6 +1111,30 @@ func TestNilMarshalerTextMapKey(t *testing.T) {
 	}
 }
 
+// textMarshalerString is a string kind that implements encoding.TextMarshaler.
+type textMarshalerString string
+
+func (s textMarshalerString) MarshalText() ([]byte, error) {
+	return []byte("X_" + string(s)), nil
+}
+
+func (s textMarshalerString) AppendText(b []byte) ([]byte, error) {
+	return append(b, ("X_" + string(s))...), nil
+}
+
+// Issue 81355: string-kind map keys are used directly even if the key type
+// implements encoding.TextMarshaler. MarshalText is still called for values.
+func TestStringKindTextMarshalerMapKey(t *testing.T) {
+	got, err := Marshal(map[textMarshalerString]textMarshalerString{"foo": "bar"})
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	const want = `{"foo":"X_bar"}`
+	if string(got) != want {
+		t.Errorf("Marshal:\n\tgot:  %s\n\twant: %s", got, want)
+	}
+}
+
 var re = regexp.MustCompile
 
 // syntactic checks on form of marshaled floating point numbers.
@@ -1218,4 +1428,22 @@ func TestIssue63379(t *testing.T) {
 			t.Errorf("expected error for %q", v)
 		}
 	}
+}
+
+// Issue #73733: encoding/json used a WaitGroup to coordinate access to cache entries.
+// Since WaitGroup.Wait is durably blocking, this caused apparent deadlocks when
+// multiple bubbles called json.Marshal at the same time.
+func TestSynctestMarshal(t *testing.T) {
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Go(func() {
+			synctest.Test(t, func(t *testing.T) {
+				_, err := Marshal([]string{})
+				if err != nil {
+					t.Errorf("Marshal: %v", err)
+				}
+			})
+		})
+	}
+	wg.Wait()
 }

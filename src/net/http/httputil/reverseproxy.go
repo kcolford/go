@@ -10,8 +10,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"internal/godebug"
 	"io"
 	"log"
+	"maps"
 	"mime"
 	"net"
 	"net/http"
@@ -42,6 +44,8 @@ type ProxyRequest struct {
 // SetURL routes the outbound request to the scheme, host, and base path
 // provided in target. If the target's path is "/base" and the incoming
 // request was for "/dir", the target request will be for "/base/dir".
+// To route requests without joining the incoming path,
+// set r.Out.URL directly.
 //
 // SetURL rewrites the outbound Host header to match the target's host.
 // To preserve the inbound request's Host header (the default behavior
@@ -100,6 +104,19 @@ func (r *ProxyRequest) SetXForwarded() {
 //
 // 1xx responses are forwarded to the client if the underlying
 // transport supports ClientTrace.Got1xxResponse.
+//
+// Upgrade requests (RFC 9110, section 7.8) are forwarded.
+// If the server responds with a 101 Switching Protocols response,
+// the subsequent data from client and server are forwarded
+// unmodified. For example, ReverseProxy forwards WebSocket connections.
+// Upgrades to "h2c" (unencrypted HTTP/2) are not forwarded.
+//
+// Hop-by-hop headers (see RFC 9110, section 7.6.1), including
+// Connection, Proxy-Connection, Keep-Alive, Proxy-Authenticate,
+// Proxy-Authorization, TE, Trailer, and Transfer-Encoding
+// are removed from client requests and backend responses.
+// Hop-by-hop Upgrade headers are preserved as described above.
+// The Rewrite function may be used to add hop-by-hop headers to the request.
 type ReverseProxy struct {
 	// Rewrite must be a function which modifies
 	// the request into a new request to be sent
@@ -121,38 +138,19 @@ type ReverseProxy struct {
 	// issues if the proxy's interpretation of query parameters
 	// does not match that of the downstream server.
 	//
+	// The outbound request contains the exact Cookie header
+	// (if any) from the inbound request.
+	// Proxies which examine request cookies should use
+	// http.ParseCookie, which returns an error,
+	// to parse and validate cookies.
+	// The Cookie, Cookies, or CookiesNamed methods of http.Request
+	// silently discard invalid cookies, and using them to access
+	// cookie values can cause security issues if the proxy's
+	// interpretation of cookie values does not match that of the
+	// downstream server.
+	//
 	// At most one of Rewrite or Director may be set.
 	Rewrite func(*ProxyRequest)
-
-	// Director is a function which modifies
-	// the request into a new request to be sent
-	// using Transport. Its response is then copied
-	// back to the original client unmodified.
-	// Director must not access the provided Request
-	// after returning.
-	//
-	// By default, the X-Forwarded-For header is set to the
-	// value of the client IP address. If an X-Forwarded-For
-	// header already exists, the client IP is appended to the
-	// existing values. As a special case, if the header
-	// exists in the Request.Header map but has a nil value
-	// (such as when set by the Director func), the X-Forwarded-For
-	// header is not modified.
-	//
-	// To prevent IP spoofing, be sure to delete any pre-existing
-	// X-Forwarded-For header coming from the client or
-	// an untrusted proxy.
-	//
-	// Hop-by-hop headers are removed from the request after
-	// Director returns, which can remove headers added by
-	// Director. Use a Rewrite function instead to ensure
-	// modifications to the request are preserved.
-	//
-	// Unparsable query parameters are removed from the outbound
-	// request if Request.Form is set after Director returns.
-	//
-	// At most one of Rewrite or Director may be set.
-	Director func(*http.Request)
 
 	// The transport used to perform proxy requests.
 	// If nil, http.DefaultTransport is used.
@@ -186,6 +184,10 @@ type ReverseProxy struct {
 	// If the backend is unreachable, the optional ErrorHandler is
 	// called without any call to ModifyResponse.
 	//
+	// Hop-by-hop headers are removed from the response before
+	// calling ModifyResponse. ModifyResponse may need to remove
+	// additional headers to fit its deployment model, such as Alt-Svc.
+	//
 	// If ModifyResponse returns an error, ErrorHandler is called
 	// with its error value. If ErrorHandler is nil, its default
 	// implementation is used.
@@ -197,6 +199,88 @@ type ReverseProxy struct {
 	// If nil, the default is to log the provided error and return
 	// a 502 Status Bad Gateway response.
 	ErrorHandler func(http.ResponseWriter, *http.Request, error)
+
+	// Director is deprecated. Use Rewrite instead.
+	//
+	// This function is insecure:
+	//
+	//   - Hop-by-hop headers are removed from the request after Director
+	//     returns, which can remove headers added by Director.
+	//     A client can designate headers as hop-by-hop by listing them
+	//     in the Connection header, so this permits a malicious client
+	//     to remove any headers that may be added by Director.
+	//
+	//   - X-Forwarded-For, X-Forwarded-Host, and X-Forwarded-Proto
+	//     headers in inbound requests are preserved by default,
+	//     which can permit IP spoofing if the Director function is
+	//     not careful to remove these headers.
+	//
+	// Rewrite addresses these issues.
+	//
+	// As an example of converting a Director function to Rewrite:
+	//
+	//	// ReverseProxy with a Director function.
+	//	proxy := &httputil.ReverseProxy{
+	//		Director: func(req *http.Request) {
+	//			req.URL.Scheme = "https"
+	//			req.URL.Host = proxyHost
+	//
+	//			// A malicious client can remove this header.
+	//			req.Header.Set("Some-Header", "some-header-value")
+	//
+	//			// X-Forwarded-* headers sent by the client are preserved,
+	//			// since Director did not remove them.
+	//		},
+	//	}
+	//
+	//	// ReverseProxy with a Rewrite function.
+	//	proxy := &httputil.ReverseProxy{
+	//		Rewrite: func(preq *httputil.ProxyRequest) {
+	//			// See also ProxyRequest.SetURL.
+	//			preq.Out.URL.Scheme = "https"
+	//			preq.Out.URL.Host = proxyHost
+	//
+	//			// This header cannot be affected by a malicious client.
+	//			preq.Out.Header.Set("Some-Header", "some-header-value")
+	//
+	//			// X-Forwarded- headers sent by the client have been
+	//			// removed from preq.Out.
+	//			// ProxyRequest.SetXForwarded optionally adds new ones.
+	//			preq.SetXForwarded()
+	//		},
+	//	}
+	//
+	// Director is a function which modifies
+	// the request into a new request to be sent
+	// using Transport. Its response is then copied
+	// back to the original client unmodified.
+	// Director must not access the provided Request
+	// after returning.
+	//
+	// By default, the X-Forwarded-For header is set to the
+	// value of the client IP address. If an X-Forwarded-For
+	// header already exists, the client IP is appended to the
+	// existing values. As a special case, if the header
+	// exists in the Request.Header map but has a nil value
+	// (such as when set by the Director func), the X-Forwarded-For
+	// header is not modified.
+	//
+	// To prevent IP spoofing, be sure to delete any pre-existing
+	// X-Forwarded-For header coming from the client or
+	// an untrusted proxy.
+	//
+	// Hop-by-hop headers are removed from the request after
+	// Director returns, which can remove headers added by
+	// Director. Use a Rewrite function instead to ensure
+	// modifications to the request are preserved.
+	//
+	// Unparsable query parameters are removed from the outbound
+	// request if Request.Form is set after Director returns.
+	//
+	// At most one of Rewrite or Director may be set.
+	//
+	// Deprecated: Use Rewrite instead.
+	Director func(*http.Request)
 }
 
 // A BufferPool is an interface for getting and returning temporary
@@ -245,6 +329,10 @@ func joinURLPath(a, b *url.URL) (path, rawpath string) {
 // the target request will be for /base/dir.
 //
 // NewSingleHostReverseProxy does not rewrite the Host header.
+//
+// For backwards compatibility reasons, NewSingleHostReverseProxy
+// returns a ReverseProxy using the deprecated Director function.
+// This proxy preserves X-Forwarded-* headers sent by the client.
 //
 // To customize the ReverseProxy behavior beyond what
 // NewSingleHostReverseProxy provides, use ReverseProxy directly
@@ -301,6 +389,7 @@ var hopHeaders = []string{
 	"Trailer", // not Trailers per URL above; https://www.rfc-editor.org/errata_search.php?eid=4522
 	"Transfer-Encoding",
 	"Upgrade",
+	"HTTP2-Settings", // RFC 7540
 }
 
 func (p *ReverseProxy) defaultErrorHandler(rw http.ResponseWriter, req *http.Request, err error) {
@@ -396,6 +485,17 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		p.getErrorHandler()(rw, req, fmt.Errorf("client tried to switch to invalid protocol %q", reqUpType))
 		return
 	}
+	if reqUpType != "" {
+		if req.ProtoMajor != 1 || req.ProtoMinor != 1 {
+			p.getErrorHandler()(rw, req, fmt.Errorf("client tried to use Upgrade header on non-HTTP/1 connection"))
+			return
+		}
+		if httpguts.HeaderValuesContainsToken([]string{reqUpType}, "h2c") {
+			// Don't allow clients to switch the connection to unencrypted HTTP/2,
+			// which allows sending further requests that bypass ReverseProxy's hooks.
+			reqUpType = ""
+		}
+	}
 	removeHopByHopHeaders(outreq.Header)
 
 	// Issue 21096: tell backend applications that care about trailer support
@@ -468,11 +568,19 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				return nil
 			}
 			h := rw.Header()
+			var orig http.Header
+			if len(h) > 0 {
+				orig = h.Clone()
+			}
+
 			copyHeader(h, http.Header(header))
 			rw.WriteHeader(code)
 
-			// Clear headers, it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses
+			// Restore the original headers (which may include headers added
+			// by middleware that ran before us).
 			clear(h)
+			maps.Copy(h, orig)
+
 			return nil
 		},
 	}
@@ -487,7 +595,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
+	// Deal with 101 Switching Protocols responses: (WebSocket, etc.)
 	if res.StatusCode == http.StatusSwitchingProtocols {
 		if !p.modifyResponse(rw, res, outreq) {
 			return
@@ -577,7 +685,7 @@ func shouldPanicOnCopyError(req *http.Request) bool {
 func removeHopByHopHeaders(h http.Header) {
 	// RFC 7230, section 6.1: Remove headers listed in the "Connection" header.
 	for _, f := range h["Connection"] {
-		for _, sf := range strings.Split(f, ",") {
+		for sf := range strings.SplitSeq(f, ",") {
 			if sf = textproto.TrimString(sf); sf != "" {
 				h.Del(sf)
 			}
@@ -739,6 +847,7 @@ func (p *ReverseProxy) handleUpgradeResponse(rw http.ResponseWriter, req *http.R
 	resUpType := upgradeType(res.Header)
 	if !ascii.IsPrint(resUpType) { // We know reqUpType is ASCII, it's checked by the caller.
 		p.getErrorHandler()(rw, req, fmt.Errorf("backend tried to switch to invalid protocol %q", resUpType))
+		return
 	}
 	if !ascii.EqualFold(reqUpType, resUpType) {
 		p.getErrorHandler()(rw, req, fmt.Errorf("backend tried to switch protocol %q when %q was requested", resUpType, reqUpType))
@@ -792,8 +901,16 @@ func (p *ReverseProxy) handleUpgradeResponse(rw http.ResponseWriter, req *http.R
 	spc := switchProtocolCopier{user: conn, backend: backConn}
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	<-errc
+
+	// Wait until both copy functions have sent on the error channel,
+	// or until one fails.
+	err := <-errc
+	if err == nil {
+		err = <-errc
+	}
 }
+
+var errCopyDone = errors.New("hijacked connection copy complete")
 
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
@@ -802,19 +919,52 @@ type switchProtocolCopier struct {
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.Copy(c.user, c.backend)
-	errc <- err
+	if _, err := io.Copy(c.user, c.backend); err != nil {
+		errc <- err
+		return
+	}
+
+	// backend conn has reached EOF so propogate close write to user conn
+	if wc, ok := c.user.(interface{ CloseWrite() error }); ok {
+		errc <- wc.CloseWrite()
+		return
+	}
+
+	errc <- errCopyDone
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.Copy(c.backend, c.user)
-	errc <- err
+	if _, err := io.Copy(c.backend, c.user); err != nil {
+		errc <- err
+		return
+	}
+
+	// user conn has reached EOF so propogate close write to backend conn
+	if wc, ok := c.backend.(interface{ CloseWrite() error }); ok {
+		errc <- wc.CloseWrite()
+		return
+	}
+
+	errc <- errCopyDone
 }
+
+var urlmaxqueryparams = godebug.New("urlmaxqueryparams")
+
+// Keep this in sync with net/url.
+const defaultMaxParams = 10000
 
 func cleanQueryParams(s string) string {
 	reencode := func(s string) string {
 		v, _ := url.ParseQuery(s)
 		return v.Encode()
+	}
+	if urlmaxqueryparams.Value() != "" {
+		// Always reencode when a non-default urlmaxqueryparams is set.
+		return reencode(s)
+	}
+	if numParams := strings.Count(s, "&") + 1; numParams > defaultMaxParams {
+		// Too many query parameters.
+		return reencode(s)
 	}
 	for i := 0; i < len(s); {
 		switch s[i] {

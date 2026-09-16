@@ -7,7 +7,8 @@
 package syscall
 
 import (
-	"internal/itoa"
+	errpkg "errors"
+	"internal/strconv"
 	"runtime"
 	"unsafe"
 )
@@ -103,12 +104,20 @@ type SysProcAttr struct {
 	// users this should be set to false for mappings work.
 	GidMappingsEnableSetgroups bool
 	AmbientCaps                []uintptr // Ambient capabilities.
+	NoNewPrivs                 bool      // Call prctl(PR_SET_NO_NEW_PRIVS) before exec.
 	UseCgroupFD                bool      // Whether to make use of the CgroupFD field.
 	CgroupFD                   int       // File descriptor of a cgroup to put the new process into.
 	// PidFD, if not nil, is used to store the pidfd of a child, if the
 	// functionality is supported by the kernel, or -1. Note *PidFD is
 	// changed only if the process starts successfully.
 	PidFD *int
+	// UseLandlock places the child into a Landlock restriction by
+	// calling landlock_restrict_self(LandlockFD, LandlockFlags) before exec.
+	//
+	// Generally this should be combined with setting NoNewPrivs.
+	UseLandlock   bool
+	LandlockFD    int    // FD of a Landlock ruleset.
+	LandlockFlags uint32 // Flags to landlock_restrict_self.
 }
 
 var (
@@ -218,10 +227,12 @@ type cloneArgs struct {
 //go:norace
 //go:nocheckptr
 func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr *ProcAttr, sys *SysProcAttr, pipe int) (pid uintptr, pidfd int32, err1 Errno, mapPipe [2]int, locked bool) {
-	// Defined in linux/prctl.h starting with Linux 4.3.
+	// Defined in linux/prctl.h starting with Linux 4.3 (PR_CAP_AMBIENT*)
+	// and Linux 3.5 (PR_SET_NO_NEW_PRIVS).
 	const (
 		PR_CAP_AMBIENT       = 0x2f
 		PR_CAP_AMBIENT_RAISE = 0x2
+		PR_SET_NO_NEW_PRIVS  = 0x26
 	)
 
 	// vfork requires that the child not touch any of the parent's
@@ -243,7 +254,7 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 		nextfd                    int
 		i                         int
 		caps                      caps
-		fd1, flags                uintptr
+		fd1, flags, ppid          uintptr
 		puid, psetgroups, pgid    []byte
 		uidmap, setgroups, gidmap []byte
 		clone3                    *cloneArgs
@@ -252,10 +263,12 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 		cred                      *Credential
 		ngroups, groups           uintptr
 		c                         uintptr
+		rlim                      *Rlimit
+		lim                       Rlimit
 	)
 	pidfd = -1
 
-	rlim := origRlimitNofile.Load()
+	rlim = origRlimitNofile.Load()
 
 	if sys.UidMappings != nil {
 		puid = []byte("/proc/self/uid_map\000")
@@ -275,7 +288,9 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 	}
 
 	// Record parent PID so child can test if it has died.
-	ppid, _ := rawSyscallNoError(SYS_GETPID, 0, 0, 0)
+	if sys.Pdeathsig != 0 {
+		ppid, _ = rawSyscallNoError(SYS_GETPID, 0, 0, 0)
+	}
 
 	// Guard against side effects of shuffling fds below.
 	// Make sure that nextfd is beyond any currently open files so
@@ -328,6 +343,7 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 	if clone3 != nil {
 		pid, err1 = rawVforkSyscall(_SYS_clone3, uintptr(unsafe.Pointer(clone3)), unsafe.Sizeof(*clone3), 0)
 	} else {
+		// N.B. Keep in sync with doCheckClonePidfd.
 		flags |= uintptr(SIGCHLD)
 		if runtime.GOARCH == "s390x" {
 			// On Linux/s390, the first two arguments of clone(2) are swapped.
@@ -361,11 +377,11 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 		if _, _, err1 = RawSyscall(SYS_CLOSE, uintptr(mapPipe[1]), 0, 0); err1 != 0 {
 			goto childerror
 		}
-		pid, _, err1 = RawSyscall(SYS_READ, uintptr(mapPipe[0]), uintptr(unsafe.Pointer(&err2)), unsafe.Sizeof(err2))
+		c, _, err1 = RawSyscall(SYS_READ, uintptr(mapPipe[0]), uintptr(unsafe.Pointer(&err2)), unsafe.Sizeof(err2))
 		if err1 != 0 {
 			goto childerror
 		}
-		if pid != unsafe.Sizeof(err2) {
+		if c != unsafe.Sizeof(err2) {
 			err1 = EINVAL
 			goto childerror
 		}
@@ -423,7 +439,7 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 			if fd1, _, err1 = RawSyscall6(SYS_OPENAT, uintptr(dirfd), uintptr(unsafe.Pointer(&psetgroups[0])), uintptr(O_WRONLY), 0, 0, 0); err1 != 0 {
 				goto childerror
 			}
-			pid, _, err1 = RawSyscall(SYS_WRITE, fd1, uintptr(unsafe.Pointer(&setgroups[0])), uintptr(len(setgroups)))
+			_, _, err1 = RawSyscall(SYS_WRITE, fd1, uintptr(unsafe.Pointer(&setgroups[0])), uintptr(len(setgroups)))
 			if err1 != 0 {
 				goto childerror
 			}
@@ -434,7 +450,7 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 			if fd1, _, err1 = RawSyscall6(SYS_OPENAT, uintptr(dirfd), uintptr(unsafe.Pointer(&pgid[0])), uintptr(O_WRONLY), 0, 0, 0); err1 != 0 {
 				goto childerror
 			}
-			pid, _, err1 = RawSyscall(SYS_WRITE, fd1, uintptr(unsafe.Pointer(&gidmap[0])), uintptr(len(gidmap)))
+			_, _, err1 = RawSyscall(SYS_WRITE, fd1, uintptr(unsafe.Pointer(&gidmap[0])), uintptr(len(gidmap)))
 			if err1 != 0 {
 				goto childerror
 			}
@@ -448,7 +464,7 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 			if fd1, _, err1 = RawSyscall6(SYS_OPENAT, uintptr(dirfd), uintptr(unsafe.Pointer(&puid[0])), uintptr(O_WRONLY), 0, 0, 0); err1 != 0 {
 				goto childerror
 			}
-			pid, _, err1 = RawSyscall(SYS_WRITE, fd1, uintptr(unsafe.Pointer(&uidmap[0])), uintptr(len(uidmap)))
+			_, _, err1 = RawSyscall(SYS_WRITE, fd1, uintptr(unsafe.Pointer(&uidmap[0])), uintptr(len(uidmap)))
 			if err1 != 0 {
 				goto childerror
 			}
@@ -515,8 +531,13 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 		for _, c = range sys.AmbientCaps {
 			// Add the c capability to the permitted and inheritable capability mask,
 			// otherwise we will not be able to add it to the ambient capability mask.
-			caps.data[capToIndex(c)].permitted |= capToMask(c)
-			caps.data[capToIndex(c)].inheritable |= capToMask(c)
+			idx := int(capToIndex(c))
+			if idx >= len(caps.data) {
+				err1 = EINVAL
+				goto childerror
+			}
+			caps.data[idx].permitted |= capToMask(c)
+			caps.data[idx].inheritable |= capToMask(c)
 		}
 
 		if _, _, err1 = RawSyscall(SYS_CAPSET, uintptr(unsafe.Pointer(&caps.hdr)), uintptr(unsafe.Pointer(&caps.data[0])), 0); err1 != 0 {
@@ -556,6 +577,22 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 			if err1 != 0 {
 				goto childerror
 			}
+		}
+	}
+
+	// Call prctl(PR_SET_NO_NEW_PRIVS).
+	if sys.NoNewPrivs {
+		_, _, err1 = RawSyscall6(SYS_PRCTL, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0)
+		if err1 != 0 {
+			goto childerror
+		}
+	}
+
+	// Enforce a Landlock policy if requested.
+	if sys.UseLandlock {
+		_, _, err1 = RawSyscall(_SYS_landlock_restrict_self, uintptr(sys.LandlockFD), uintptr(sys.LandlockFlags), 0)
+		if err1 != 0 {
+			goto childerror
 		}
 	}
 
@@ -632,7 +669,20 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 
 	// Restore original rlimit.
 	if rlim != nil {
-		rawSetrlimit(RLIMIT_NOFILE, rlim)
+		// Some other process may have changed our rlimit by
+		// calling prlimit. We can check for that case because
+		// our current rlimit will not be the value we set when
+		// caching the rlimit in the init function in rlimit.go.
+		//
+		// Note that this test is imperfect, since it won't catch
+		// the case in which some other process used prlimit to
+		// set our rlimits to max-1/max. In that case we will fall
+		// back to the original cur/max when starting the child.
+		// We hope that setting to max-1/max is unlikely.
+		_, _, err1 = RawSyscall6(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, 0, uintptr(unsafe.Pointer(&lim)), 0, 0)
+		if err1 != 0 || (lim.Cur == rlim.Max-1 && lim.Max == rlim.Max) {
+			RawSyscall6(SYS_PRLIMIT64, 0, RLIMIT_NOFILE, uintptr(unsafe.Pointer(rlim)), 0, 0, 0)
+		}
 	}
 
 	// Enable tracing if requested.
@@ -662,7 +712,7 @@ childerror:
 func formatIDMappings(idMap []SysProcIDMap) []byte {
 	var data []byte
 	for _, im := range idMap {
-		data = append(data, itoa.Itoa(im.ContainerID)+" "+itoa.Itoa(im.HostID)+" "+itoa.Itoa(im.Size)+"\n"...)
+		data = append(data, strconv.Itoa(im.ContainerID)+" "+strconv.Itoa(im.HostID)+" "+strconv.Itoa(im.Size)+"\n"...)
 	}
 	return data
 }
@@ -691,7 +741,7 @@ func writeIDMappings(path string, idMap []SysProcIDMap) error {
 // This is needed since kernel 3.19, because you can't write gid_map without
 // disabling setgroups() system call.
 func writeSetgroups(pid int, enable bool) error {
-	sgf := "/proc/" + itoa.Itoa(pid) + "/setgroups"
+	sgf := "/proc/" + strconv.Itoa(pid) + "/setgroups"
 	fd, err := Open(sgf, O_RDWR, 0)
 	if err != nil {
 		return err
@@ -716,7 +766,7 @@ func writeSetgroups(pid int, enable bool) error {
 // for a process and it is called from the parent process.
 func writeUidGidMappings(pid int, sys *SysProcAttr) error {
 	if sys.UidMappings != nil {
-		uidf := "/proc/" + itoa.Itoa(pid) + "/uid_map"
+		uidf := "/proc/" + strconv.Itoa(pid) + "/uid_map"
 		if err := writeIDMappings(uidf, sys.UidMappings); err != nil {
 			return err
 		}
@@ -727,11 +777,128 @@ func writeUidGidMappings(pid int, sys *SysProcAttr) error {
 		if err := writeSetgroups(pid, sys.GidMappingsEnableSetgroups); err != nil && err != ENOENT {
 			return err
 		}
-		gidf := "/proc/" + itoa.Itoa(pid) + "/gid_map"
+		gidf := "/proc/" + strconv.Itoa(pid) + "/gid_map"
 		if err := writeIDMappings(gidf, sys.GidMappings); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// forkAndExecFailureCleanup cleans up after an exec failure.
+func forkAndExecFailureCleanup(attr *ProcAttr, sys *SysProcAttr) {
+	if sys.PidFD != nil && *sys.PidFD != -1 {
+		Close(*sys.PidFD)
+		*sys.PidFD = -1
+	}
+}
+
+// checkClonePidfd verifies that clone(CLONE_PIDFD) works by actually doing a
+// clone.
+//
+//go:linkname os_checkClonePidfd os.checkClonePidfd
+func os_checkClonePidfd() error {
+	pidfd := int32(-1)
+	pid, errno := doCheckClonePidfd(&pidfd)
+	if errno != 0 {
+		return errno
+	}
+
+	if pidfd == -1 {
+		// Bad: CLONE_PIDFD failed to provide a pidfd. Reap the process
+		// before returning.
+
+		var err error
+		for {
+			var status WaitStatus
+			// WCLONE is an untyped constant that sets bit 31, so
+			// it cannot convert directly to int on 32-bit
+			// GOARCHes. We must convert through another type
+			// first.
+			flags := uint(WCLONE)
+			_, err = Wait4(int(pid), &status, int(flags), nil)
+			if err != EINTR {
+				break
+			}
+		}
+		if err != nil {
+			return err
+		}
+
+		return errpkg.New("clone(CLONE_PIDFD) failed to return pidfd")
+	}
+
+	// Good: CLONE_PIDFD provided a pidfd. Reap the process and close the
+	// pidfd.
+	defer Close(int(pidfd))
+
+	// TODO(roland): this is necessary to prevent valgrind from complaining
+	// about passing 0x0 to waitid, which is doesn't like. This is clearly not
+	// ideal. The structures are copied (mostly) verbatim from syscall/unix,
+	// which we obviously cannot import because of an import loop.
+
+	const is64bit = ^uint(0) >> 63 // 0 for 32-bit hosts, 1 for 64-bit ones.
+	type sigInfo struct {
+		Signo int32
+		_     struct {
+			Errno int32
+			Code  int32
+		} // Two int32 fields, swapped on MIPS.
+		_ [is64bit]int32 // Extra padding for 64-bit hosts only.
+
+		// End of common part. Beginning of signal-specific part.
+
+		Pid    int32
+		Uid    uint32
+		Status int32
+
+		// Pad to 128 bytes.
+		_ [128 - (6+is64bit)*4]byte
+	}
+
+	for {
+		const _P_PIDFD = 3
+		var info sigInfo
+		_, _, errno = Syscall6(SYS_WAITID, _P_PIDFD, uintptr(pidfd), uintptr(unsafe.Pointer(&info)), WEXITED|WCLONE, 0, 0)
+		if errno != EINTR {
+			break
+		}
+	}
+	if errno != 0 {
+		return errno
+	}
+
+	return nil
+}
+
+// doCheckClonePidfd implements the actual clone call of os_checkClonePidfd and
+// child execution. This is a separate function so we can separate the child's
+// and parent's stack frames if we're using vfork.
+//
+// This is go:noinline because the point is to keep the stack frames of this
+// and os_checkClonePidfd separate.
+//
+//go:noinline
+func doCheckClonePidfd(pidfd *int32) (pid uintptr, errno Errno) {
+	flags := uintptr(CLONE_VFORK | CLONE_VM | CLONE_PIDFD)
+	if runtime.GOARCH == "s390x" {
+		// On Linux/s390, the first two arguments of clone(2) are swapped.
+		pid, errno = rawVforkSyscall(SYS_CLONE, 0, flags, uintptr(unsafe.Pointer(pidfd)))
+	} else {
+		pid, errno = rawVforkSyscall(SYS_CLONE, flags, 0, uintptr(unsafe.Pointer(pidfd)))
+	}
+	if errno != 0 || pid != 0 {
+		// If we're in the parent, we must return immediately
+		// so we're not in the same stack frame as the child.
+		// This can at most use the return PC, which the child
+		// will not modify, and the results of
+		// rawVforkSyscall, which must have been written after
+		// the child was replaced.
+		return
+	}
+
+	for {
+		RawSyscall(SYS_EXIT_GROUP, 0, 0, 0)
+	}
 }

@@ -9,7 +9,6 @@ import (
 	"internal/testenv"
 	"os"
 	. "path/filepath"
-	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -106,6 +105,23 @@ func TestMatch(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkMatch(b *testing.B) {
+	for _, tt := range matchTests {
+		name := fmt.Sprintf("%q %q", tt.pattern, tt.s)
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				bSink, errSink = Match(tt.pattern, tt.s)
+			}
+		})
+	}
+}
+
+var (
+	bSink   bool
+	errSink error
+)
 
 var globTests = []struct {
 	pattern, result string
@@ -232,7 +248,7 @@ func (test *globTest) globAbs(root, rootPattern string) error {
 	}
 	slices.Sort(have)
 	want := test.buildWant(root + `\`)
-	if strings.Join(want, "_") == strings.Join(have, "_") {
+	if slices.Equal(want, have) {
 		return nil
 	}
 	return fmt.Errorf("Glob(%q) returns %q, but %q expected", p, have, want)
@@ -246,12 +262,12 @@ func (test *globTest) globRel(root string) error {
 	}
 	slices.Sort(have)
 	want := test.buildWant(root)
-	if strings.Join(want, "_") == strings.Join(have, "_") {
+	if slices.Equal(want, have) {
 		return nil
 	}
 	// try also matching version without root prefix
 	wantWithNoRoot := test.buildWant("")
-	if strings.Join(wantWithNoRoot, "_") == strings.Join(have, "_") {
+	if slices.Equal(wantWithNoRoot, have) {
 		return nil
 	}
 	return fmt.Errorf("Glob(%q) returns %q, but %q expected", p, have, want)
@@ -327,20 +343,7 @@ func TestWindowsGlob(t *testing.T) {
 	}
 
 	// test relative paths
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = os.Chdir(tmpDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		err := os.Chdir(wd)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
+	t.Chdir(tmpDir)
 	for _, test := range tests {
 		err := test.globRel("")
 		if err != nil {
@@ -367,7 +370,7 @@ func TestNonWindowsGlobEscape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Glob error for %q: %s", pattern, err)
 	}
-	if !reflect.DeepEqual(matches, want) {
+	if !slices.Equal(matches, want) {
 		t.Fatalf("Glob(%#q) = %v want %v", pattern, matches, want)
 	}
 }

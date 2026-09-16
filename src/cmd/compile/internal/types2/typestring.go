@@ -9,7 +9,7 @@ package types2
 import (
 	"bytes"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -211,14 +211,6 @@ func (w *typeWriter) typ(typ Type) {
 
 	case *Interface:
 		if w.ctxt == nil {
-			if t == universeAnyAlias.Type().Underlying() {
-				// When not hashing, we can try to improve type strings by writing "any"
-				// for a type that is pointer-identical to universeAny.
-				// TODO(rfindley): this logic should not be necessary with
-				// gotypesalias=1. Remove once that is always the case.
-				w.string("any")
-				break
-			}
 			if t == asNamed(universeComparable.Type()).underlying {
 				w.string("interface{comparable}")
 				break
@@ -308,7 +300,7 @@ func (w *typeWriter) typ(typ Type) {
 			w.error("unnamed type parameter")
 			break
 		}
-		if i := tparamIndex(w.tparams.list(), t); i >= 0 {
+		if i := slices.Index(w.tparams.list(), t); i >= 0 {
 			// The names of type parameters that are declared by the type being
 			// hashed are not part of the type identity. Replace them with a
 			// placeholder indicating their index.
@@ -338,10 +330,17 @@ func (w *typeWriter) typ(typ Type) {
 		if list := t.targs.list(); len(list) != 0 {
 			// instantiated type
 			w.typeList(list)
+		} else if w.ctxt == nil && t.TypeParams().Len() != 0 { // For type hashing, don't need to format the TypeParams
+			// parameterized type
+			w.tParamList(t.TypeParams().list())
 		}
 		if w.ctxt != nil {
 			// TODO(gri) do we need to print the alias type name, too?
-			w.typ(Unalias(t.obj.typ))
+			typ := Unalias(t.obj.typ)
+			if typ == nil {
+				panic("known implementation limitation: encountered an incomplete alias (see go.dev/issue/78296)")
+			}
+			w.typ(typ)
 		}
 
 	default:
@@ -379,7 +378,7 @@ func (w *typeWriter) typeSet(s *_TypeSet) {
 			newTypeHasher(&buf, w.ctxt).typ(term.typ)
 			termHashes = append(termHashes, buf.String())
 		}
-		sort.Strings(termHashes)
+		slices.Sort(termHashes)
 		if !first {
 			w.byte(';')
 		}
@@ -446,22 +445,25 @@ func (w *typeWriter) tuple(tup *Tuple, variadic bool) {
 			}
 			typ := v.typ
 			if variadic && i == len(tup.vars)-1 {
-				if s, ok := typ.(*Slice); ok {
+				if slice, ok := typ.(*Slice); ok {
 					w.string("...")
-					typ = s.elem
+					w.typ(slice.elem)
 				} else {
-					// special case:
-					// append(s, "foo"...) leads to signature func([]byte, string...)
-					if t, _ := under(typ).(*Basic); t == nil || t.kind != String {
-						w.error("expected string type")
-						continue
-					}
+					// append(slice, str...) entails various special
+					// cases, especially in conjunction with generics.
+					// str may be:
+					// - a string,
+					// - a TypeParam whose typeset includes string, or
+					// - a named []byte slice type B resulting from
+					//   a client instantiating append([]byte, T) at T=B.
+					// For such cases we use the irregular notation
+					// func([]byte, T...), with the dots after the type.
 					w.typ(typ)
 					w.string("...")
-					continue
 				}
+			} else {
+				w.typ(typ)
 			}
-			w.typ(typ)
 		}
 	}
 	w.byte(')')

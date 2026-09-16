@@ -5,6 +5,7 @@
 package regexp
 
 import (
+	"bytes"
 	"reflect"
 	"regexp/syntax"
 	"slices"
@@ -79,6 +80,9 @@ func TestBadCompile(t *testing.T) {
 }
 
 func matchTest(t *testing.T, test *FindTest) {
+	if test.max == 0 {
+		return
+	}
 	re := compileTest(t, test.pat, "")
 	if re == nil {
 		return
@@ -613,6 +617,19 @@ func BenchmarkFindAllNoMatches(b *testing.B) {
 	}
 }
 
+func BenchmarkFindAllTenMatches(b *testing.B) {
+	re := MustCompile("a+b+")
+	s := bytes.Repeat([]byte("acddeeabbax"), 10)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		all := re.FindAll(s, -1)
+		if len(all) != 10 {
+			b.Fatalf("FindAll(%q) = %q; want 10 matches", s, all)
+		}
+	}
+}
+
 func BenchmarkFindString(b *testing.B) {
 	b.StopTimer()
 	re := MustCompile("a+b+")
@@ -959,6 +976,21 @@ func TestUnmarshalText(t *testing.T) {
 			continue
 		}
 		if err := unmarshaled.UnmarshalText(marshaled); err != nil {
+			t.Errorf("regexp %#q failed to unmarshal: %s", re, err)
+			continue
+		}
+		if unmarshaled.String() != goodRe[i] {
+			t.Errorf("UnmarshalText returned unexpected value: %s", unmarshaled.String())
+		}
+
+		buf := make([]byte, 4, 32)
+		marshalAppend, err := re.AppendText(buf)
+		if err != nil {
+			t.Errorf("regexp %#q failed to marshal: %s", re, err)
+			continue
+		}
+		marshalAppend = marshalAppend[4:]
+		if err := unmarshaled.UnmarshalText(marshalAppend); err != nil {
 			t.Errorf("regexp %#q failed to unmarshal: %s", re, err)
 			continue
 		}

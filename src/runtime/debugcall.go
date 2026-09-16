@@ -2,15 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Though the debug call function feature is not enabled on
-// ppc64, inserted ppc64 to avoid missing Go declaration error
-// for debugCallPanicked while building runtime.test
-//go:build amd64 || arm64 || ppc64le || ppc64
+//go:build amd64 || arm64 || loong64 || ppc64le || ppc64
 
 package runtime
 
 import (
 	"internal/abi"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -34,7 +32,7 @@ func debugCallCheck(pc uintptr) string {
 	if getg() != getg().m.curg {
 		return debugCallSystemStack
 	}
-	if sp := getcallersp(); !(getg().stack.lo < sp && sp <= getg().stack.hi) {
+	if sp := sys.GetCallerSP(); !(getg().stack.lo < sp && sp <= getg().stack.hi) {
 		// Fast syscalls (nanotime) and racecall switch to the
 		// g0 stack without switching g. We can't safely make
 		// a call in this state. (We can't even safely
@@ -106,7 +104,7 @@ func debugCallCheck(pc uintptr) string {
 //go:nosplit
 func debugCallWrap(dispatch uintptr) {
 	var lockedExt uint32
-	callerpc := getcallerpc()
+	callerpc := sys.GetCallerPC()
 	gp := getg()
 
 	// Lock ourselves to the OS thread.

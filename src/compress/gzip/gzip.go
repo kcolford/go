@@ -13,8 +13,8 @@ import (
 	"time"
 )
 
-// These constants are copied from the flate package, so that code that imports
-// "compress/gzip" does not also have to import "compress/flate".
+// These constants are copied from the [flate] package, so that code that imports
+// [compress/gzip] does not also have to import [compress/flate].
 const (
 	NoCompression      = flate.NoCompression
 	BestSpeed          = flate.BestSpeed
@@ -23,7 +23,7 @@ const (
 	HuffmanOnly        = flate.HuffmanOnly
 )
 
-// A Writer is an io.WriteCloser.
+// A Writer is an [io.WriteCloser].
 // Writes to a Writer are compressed and written to w.
 type Writer struct {
 	Header      // written at first call to Write, Flush, or Close
@@ -44,8 +44,12 @@ type Writer struct {
 // It is the caller's responsibility to call Close on the [Writer] when done.
 // Writes may be buffered and not flushed until Close.
 //
-// Callers that wish to set the fields in Writer.Header must do so before
+// Callers that wish to set the fields in Writer.[Header] must do so before
 // the first call to Write, Flush, or Close.
+//
+// Note that the exact bytes written to w are not covered by the Go 1
+// compatibility promise. Callers, including tests, should not depend on the
+// exact written bytes.
 func NewWriter(w io.Writer) *Writer {
 	z, _ := NewWriterLevel(w, DefaultCompression)
 	return z
@@ -57,6 +61,10 @@ func NewWriter(w io.Writer) *Writer {
 // The compression level can be [DefaultCompression], [NoCompression], [HuffmanOnly]
 // or any integer value between [BestSpeed] and [BestCompression] inclusive.
 // The error returned will be nil if the level is valid.
+//
+// Note that the exact bytes written to w are not covered by the Go 1
+// compatibility promise. Callers, including tests, should not depend on the
+// exact written bytes.
 func NewWriterLevel(w io.Writer, level int) (*Writer, error) {
 	if level < HuffmanOnly || level > BestCompression {
 		return nil, fmt.Errorf("gzip: invalid compression level: %d", level)
@@ -246,5 +254,6 @@ func (z *Writer) Close() error {
 	le.PutUint32(z.buf[:4], z.digest)
 	le.PutUint32(z.buf[4:8], z.size)
 	_, z.err = z.w.Write(z.buf[:8])
+	z.w = nil
 	return z.err
 }
